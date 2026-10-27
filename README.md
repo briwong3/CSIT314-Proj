@@ -1,4 +1,4 @@
-# CPU Interior Designer Matching
+# CPU Interior Designer CSIT314 Project
 
 A browser-based interior designer matching app using Supabase for authentication, database storage, row-level security, and an Edge Function for privileged account management.
 
