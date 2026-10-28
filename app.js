@@ -12,7 +12,7 @@ class User { constructor(r) { Object.assign(this, r); } get isSuspended() { retu
 class Permissions { // access matrix: which tabs each role may open
   static #tabs = {
     customer: ['projects', 'designers'],
-    designer: ['projects', 'designers'],
+    designer: ['dashboard'],
     platform: ['dashboard', 'categories'],
     admin: ['dashboard', 'accounts', 'profiles', 'logs']
   };
@@ -113,8 +113,59 @@ class DesignerController { // "find a designer": search, filter, sort, details
       description: fields.description || null,
       category_id: fields.category_id || null,
       budget: fields.budget === '' || fields.budget == null ? null : Number(fields.budget),
+      stage: fields.stage || 'completed',
+      progress: fields.progress == null ? 100 : Number(fields.progress),
+      visibility: fields.visibility || 'published',
       image_url: imageUrl
     }));
+  }
+  async saveCompany(designerId, fields) {
+    const existing = must(await db.from('companies').select('id').eq('designer_id', designerId).limit(1).maybeSingle());
+    if (existing) return must(await db.from('companies').update(fields).eq('id', existing.id).eq('designer_id', designerId));
+    return must(await db.from('companies').insert({ designer_id: designerId, ...fields }));
+  }
+  async uploadCompanyAsset(designerId, kind, file) {
+    if (!file) return null;
+    const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, '_');
+    const path = `companies/${designerId}/${kind}-${Date.now()}-${safeName}`;
+    const { error } = await db.storage.from('project-images').upload(path, file, {
+      cacheControl: '3600',
+      upsert: false,
+      contentType: file.type || 'application/octet-stream'
+    });
+    if (error) throw error;
+    return db.storage.from('project-images').getPublicUrl(path).data.publicUrl;
+  }
+  async designerActivity(designerId, from) {
+    let query = db.from('project_activity').select('project_id,activity_type,created_at').eq('designer_id', designerId);
+    if (from) query = query.gte('created_at', from);
+    return must(await query.order('created_at'));
+  }
+  async designerAppointments(designerId) {
+    return must(await db.from('appointment_requests')
+      .select('id,customer_id,project_id,requested_for,status,request_message,response_message,created_at,designer_read_at,customer:profiles!appointment_requests_customer_id_fkey(name),project:projects(title)')
+      .eq('designer_id', designerId)
+      .order('requested_for'));
+  }
+  async createAppointmentRequest(fields) {
+    return must(await db.from('appointment_requests').insert(fields).select('id').single());
+  }
+  updateAppointment(id, designerId, fields) {
+    return db.from('appointment_requests').update(fields).eq('id', id).eq('designer_id', designerId).then(must);
+  }
+  markAppointmentRead(id, designerId) {
+    return db.from('appointment_requests').update({ designer_read_at: new Date().toISOString() })
+      .eq('id', id).eq('designer_id', designerId).is('designer_read_at', null).then(must);
+  }
+  async designerMilestones(designerId) {
+    return must(await db.from('project_milestones')
+      .select('id,project_id,view_count,created_at,read_at,project:projects(title)')
+      .eq('designer_id', designerId)
+      .order('created_at', { ascending: false }));
+  }
+  markMilestoneRead(id, designerId) {
+    return db.from('project_milestones').update({ read_at: new Date().toISOString() })
+      .eq('id', id).eq('designer_id', designerId).is('read_at', null).then(must);
   }
   async designerVerificationQueue() {
     const [profiles, companies] = await Promise.all([
@@ -146,7 +197,7 @@ class DesignerController { // "find a designer": search, filter, sort, details
     }));
   }
   async search({ q, cat, min, max, sort }) {
-    let r = db.from('projects').select('*, categories(name), profiles(id,name)');
+    let r = db.from('projects').select('*, categories(name), profiles(id,name)').eq('visibility', 'published');
     if (q) r = r.ilike('title', `%${q}%`);
     if (cat) r = r.eq('category_id', cat);
     if (min) r = r.gte('budget', min);
@@ -157,7 +208,7 @@ class DesignerController { // "find a designer": search, filter, sort, details
     const [profiles, companies, projects] = await Promise.all([
       db.from('profiles').select('id,name').eq('role', 'designer').order('name'),
       db.from('companies').select('designer_id,name,bio'),
-      db.from('projects').select('designer_id,views,category_id,categories(name)')
+      db.from('projects').select('designer_id,views,category_id,categories(name)').eq('visibility', 'published')
     ]);
     const designerProfiles = must(profiles);
     const designerCompanies = must(companies);
@@ -187,12 +238,26 @@ class DesignerController { // "find a designer": search, filter, sort, details
   }
   async project(id) {
     await db.rpc('increment_views', { pid: id });
-    const p = must(await db.from('projects').select('*, categories(name), profiles(id,name)').eq('id', id).single());
+    const p = must(await db.from('projects').select('*, categories(name), profiles(id,name)').eq('id', id).eq('visibility', 'published').single());
     const [comments, company] = await Promise.all([
       db.from('comments').select('*').eq('project_id', id).order('created_at'),
       db.from('companies').select('name').eq('designer_id', p.designer_id).limit(1)
     ]);
     return { p, comments: must(comments), company: must(company)[0] };
+  }
+  updateProject(id, designerId, fields) {
+    return db.from('projects').update(fields).eq('id', id).eq('designer_id', designerId).then(must);
+  }
+  async deleteProject(id, designerId) {
+    const project = must(await db.from('projects').select('image_url').eq('id', id).eq('designer_id', designerId).single());
+    must(await db.from('projects').delete().eq('id', id).eq('designer_id', designerId));
+    if (!project.image_url) return null;
+    const marker = '/storage/v1/object/public/project-images/';
+    const index = project.image_url.indexOf(marker);
+    if (index < 0) return null;
+    const path = decodeURIComponent(project.image_url.slice(index + marker.length));
+    const { error } = await db.storage.from('project-images').remove([path]);
+    return error ? `Project was deleted, but its image could not be removed: ${error.message}` : null;
   }
   async designer(id) {
     const profile = must(await db.from('profiles').select('id,name').eq('id', id).single());
@@ -318,6 +383,19 @@ class InboxController {
         conversation: conversations.find(item => item.id === message.conversation_id)
       }));
   }
+  async notificationMessages() {
+    const conversations = await this.conversations();
+    const recent = await this.recentMessages(conversations.map(conversation => conversation.id));
+    const participants = new Map(conversations.map(conversation => [conversation.id,
+      this.user.id === conversation.customer_id ? conversation.designer : conversation.customer]));
+    return recent
+      .filter(message => message.sender_id !== this.user.id)
+      .map(message => ({
+        ...message,
+        sender: participants.get(message.conversation_id)?.name ?? 'New message',
+        conversation: conversations.find(item => item.id === message.conversation_id)
+      }));
+  }
   async startWithDesigner(designerId, projectId = null) {
     if (!this.user || this.user.role !== 'customer') throw new Error('Only customer accounts can start a conversation with a designer.');
     if (designerId === this.user.id) throw new Error('You cannot message yourself.');
@@ -366,6 +444,8 @@ class App {
       ? Permissions.tabs('admin')
       : this.user?.role === 'platform'
         ? Permissions.tabs('platform')
+        : this.user?.role === 'designer'
+          ? Permissions.tabs('designer')
         : ['projects', 'designers', 'favorites'];
     const brand = this.$('header b');
     brand.setAttribute('role', 'link');
@@ -382,6 +462,7 @@ class App {
     this.$('header').classList.remove('auth-header');
     this.$('header').classList.toggle('landing-header', !this.user);
     this.$('header').classList.toggle('signed-in-header', Boolean(this.user));
+    this.$('header').classList.toggle('designer-signed-in-header', this.user?.role === 'designer');
     this.$('header').hidden = false;
     this.$('#nav').innerHTML = this.user?.role === 'platform'
       ? ''
@@ -440,9 +521,17 @@ class App {
         ['admin', 'platform'].includes(this.user.role) ? Promise.resolve([]) : this.inbox.unreadNotifications(),
         ['admin', 'platform'].includes(this.user.role) ? this.admin.notifications() : Promise.resolve([])
       ]);
+      const appointments = this.user.role === 'designer'
+        ? await this.designers.designerAppointments(this.user.id)
+        : [];
+      const milestones = this.user.role === 'designer'
+        ? await this.designers.designerMilestones(this.user.id)
+        : [];
       const badge = this.$('#notification-count');
       if (!badge || this.user?.id !== userId) return;
-      const unreadCount = unread.length + adminNotices.filter(notice => !notice.read_at).length;
+      const unreadCount = unread.length + adminNotices.filter(notice => !notice.read_at).length
+        + appointments.filter(appointment => !appointment.designer_read_at).length
+        + milestones.filter(milestone => !milestone.read_at).length;
       badge.textContent = unreadCount > 99 ? '99+' : String(unreadCount);
       badge.hidden = unreadCount === 0;
       this.$('#notification-bell').setAttribute('aria-label', unreadCount ? `Notifications, ${unreadCount} unread` : 'Notifications');
@@ -468,6 +557,12 @@ class App {
     try {
       const isPlatform = this.user.role === 'platform';
       const unread = ['admin', 'platform'].includes(this.user.role) ? [] : await this.inbox.unreadNotifications();
+      const appointments = this.user.role === 'designer'
+        ? await this.designers.designerAppointments(this.user.id)
+        : [];
+      const milestones = this.user.role === 'designer'
+        ? await this.designers.designerMilestones(this.user.id)
+        : [];
       const previewList = popover.querySelector('.notification-preview-list');
       let adminNotices = [];
       if (['admin', 'platform'].includes(this.user.role)) {
@@ -491,8 +586,20 @@ class App {
         <button type="button" class="notification-preview-item" data-open-conversation="${message.conversation_id}">
           <strong>New message</strong><span>${esc(message.sender)} sent you a message.</span><small>${new Date(message.created_at).toLocaleString()}</small>
         </button>`).join('');
+      const appointmentPreview = appointments.filter(item => !item.designer_read_at).slice(0, 3).map(appointment => `
+        <button type="button" class="notification-preview-item" data-open-appointments>
+          <strong>New appointment request</strong><span>${esc(appointment.customer?.name || 'A customer')} requested a meeting${appointment.project?.title ? ` about “${esc(appointment.project.title)}”` : ''}.</span><small>${new Date(appointment.created_at).toLocaleString()}</small>
+        </button>`).join('');
+      const milestonePreview = milestones.filter(item => !item.read_at).slice(0, 2).map(milestone => `
+        <button type="button" class="notification-preview-item" data-open-insights>
+          <strong>Project milestone</strong><span>${esc(milestone.project?.title || 'Your project')} reached ${milestone.view_count} views.</span><small>${new Date(milestone.created_at).toLocaleString()}</small>
+        </button>`).join('');
       previewList.insertAdjacentHTML('afterbegin', messagePreview);
-      const unreadCount = unread.length + adminNotices.filter(notice => !notice.read_at).length;
+      previewList.insertAdjacentHTML('afterbegin', appointmentPreview);
+      previewList.insertAdjacentHTML('afterbegin', milestonePreview);
+      const unreadCount = unread.length + adminNotices.filter(notice => !notice.read_at).length
+        + appointments.filter(item => !item.designer_read_at).length
+        + milestones.filter(item => !item.read_at).length;
       popover.querySelector('.notification-popover-heading span').textContent = unreadCount ? `${unreadCount} new` : 'Up to date';
       if (!previewList.children.length) {
         previewList.innerHTML = '<p class="notification-empty">You have no new notifications.</p>';
@@ -501,6 +608,8 @@ class App {
       popover.onclick = e => {
         const conversation = e.target.closest('[data-open-conversation]');
         if (conversation) this.open('messages', Number(conversation.dataset.openConversation));
+        else if (e.target.closest('[data-open-appointments]')) this.open('notifications');
+        else if (e.target.closest('[data-open-insights]')) this.openDesignerDashboardView('insights');
         else if (e.target.closest('[data-admin-notification]')) {
           const item = e.target.closest('[data-admin-notification]');
           if (isPlatform && item.dataset.noticeKind === 'designer_signup') this.open('verification');
@@ -520,6 +629,7 @@ class App {
     this.$('#main').classList.toggle('auth-main', Boolean(this.$('#main').querySelector('.auth-page')));
     this.$('#main').classList.toggle('messages-main', Boolean(this.$('#main').querySelector('.messages-page')));
     this.$('#main').classList.toggle('project-detail-main', Boolean(this.$('#main').querySelector('.project-detail')));
+    this.$('#main').classList.toggle('designer-main', Boolean(this.$('#main').querySelector('.designer-dashboard')));
   }
   guard(fn) { return async e => { e?.preventDefault?.(); const target = e?.currentTarget; try { await fn(e); } catch (x) { const el = target?.querySelector?.('.err[role="alert"]') || this.$('#msg'); if (el) { el.className = 'err'; el.textContent = x.message; } else throw x; } }; }
   ok(m) { const el = this.$('#msg'); if (el) { el.className = ''; el.textContent = m; } }
@@ -947,17 +1057,23 @@ class App {
     }));
   }
   async designerView(id) {
-    const { profile, company, projects } = await this.designers.designer(id);
+    const { profile, company, projects: allProjects } = await this.designers.designer(id);
+    const projects = allProjects.filter(project => project.visibility !== 'draft');
     const specialties = [...new Set(projects.map(project => project.categories?.name).filter(Boolean))];
     const totalViews = projects.reduce((total, project) => total + Number(project.views ?? 0), 0);
     const companyName = company?.name ?? profile.name;
+    const workflowSteps = company?.workflow_public && Array.isArray(company.workflow_steps) ? company.workflow_steps : [];
+    const companySpecialties = Array.isArray(company?.specialties) ? company.specialties : [];
+    const designAreas = Array.isArray(company?.design_areas) ? company.design_areas : [];
+    const services = String(company?.services ?? '').split('\n').map(service => service.trim()).filter(Boolean);
+    const companyWebsite = /^https?:\/\//i.test(String(company?.website ?? '')) ? String(company.website) : '';
     this.show(`<section class="designer-profile">
       <p class="designer-profile-back-link"><a id="back" href="#">← Back to designers</a></p>
       <div class="designer-profile-hero">
-        <div class="designer-profile-cover"><span>Cover photo placeholder</span></div>
+        <div class="designer-profile-cover" ${company?.cover_url ? `style="background-image:url('${esc(company.cover_url)}');background-size:cover;background-position:center"` : ''}><span>${company?.cover_url ? '' : 'Cover photo placeholder'}</span></div>
         <div class="designer-profile-heading">
-          <div class="designer-profile-avatar" aria-hidden="true">${esc(companyName.slice(0, 1).toUpperCase())}</div>
-          <div class="designer-profile-identity"><h1>${esc(companyName)}</h1><p>${esc(company?.bio || 'Interior design studio')}</p></div>
+          <div class="designer-profile-avatar" aria-hidden="true">${company?.logo_url ? `<img src="${esc(company.logo_url)}" alt="">` : esc(companyName.slice(0, 1).toUpperCase())}</div>
+          <div class="designer-profile-identity"><h1>${esc(companyName)}</h1><p>${esc(company?.tagline || company?.bio || 'Interior design studio')}</p></div>
           <div class="designer-profile-actions">
             ${this.user.role === 'customer' ? `<button class="btn" id="message-designer" type="button">Contact designer</button>` : ''}
             ${this.user.role === 'customer' ? `<button class="btn secondary-btn" id="book-appointment" type="button">Book an appointment</button>` : ''}
@@ -968,33 +1084,29 @@ class App {
       <div class="designer-profile-content">
         <aside class="designer-profile-sidebar">
           <section class="designer-info-card"><h2>About the company</h2><p>${esc(company?.bio || `${companyName} creates thoughtful interior spaces tailored to each client.`)}</p>
-            <dl><div><dt>Designer</dt><dd>${esc(profile.name)}</dd></div><div><dt>Projects</dt><dd>${projects.length}</dd></div><div><dt>Specialties</dt><dd>${specialties.length ? esc(specialties.join(', ')) : 'Interior design'}</dd></div></dl>
+            <dl><div><dt>Designer</dt><dd>${esc(profile.name)}</dd></div><div><dt>Projects</dt><dd>${projects.length}</dd></div><div><dt>Specialties</dt><dd>${esc(companySpecialties.join(', ') || specialties.join(', ') || 'Interior design')}</dd></div>${company?.year_established ? `<div><dt>Established</dt><dd>${Number(company.year_established)}</dd></div>` : ''}${company?.email ? `<div><dt>Email</dt><dd><a href="mailto:${esc(company.email)}">${esc(company.email)}</a></dd></div>` : ''}${company?.phone ? `<div><dt>Phone</dt><dd>${esc(company.phone)}</dd></div>` : ''}${companyWebsite ? `<div><dt>Website</dt><dd><a href="${esc(companyWebsite)}" target="_blank" rel="noopener noreferrer">${esc(companyWebsite)}</a></dd></div>` : ''}${company?.address ? `<div><dt>Address</dt><dd>${esc(company.address)}</dd></div>` : ''}</dl>
           </section>
-          ${specialties.length ? `<section class="designer-info-card"><h2>Services and areas of design</h2><div class="designer-service-chips">${specialties.map(specialty => `<span>${esc(specialty)}</span>`).join('')}</div></section>` : ''}
+          ${companySpecialties.length || designAreas.length || services.length ? `<section class="designer-info-card"><h2>Services and areas of design</h2>${services.length ? `<div class="designer-service-chips">${services.map(service => `<span>${esc(service)}</span>`).join('')}</div>` : ''}<div class="designer-service-chips">${[...companySpecialties, ...designAreas].map(value => `<span>${esc(value)}</span>`).join('')}</div></section>` : ''}
         </aside>
         <div class="designer-portfolio">
           <div class="designer-portfolio-heading"><div><h2>Projects by ${esc(companyName)}</h2><p>${projects.length} ${projects.length === 1 ? 'project' : 'projects'} · ${totalViews.toLocaleString()} total views</p></div></div>
-          <div class="project-browser-grid">${projects.map((p, index) => `<article class="browse-project-card"><button type="button" class="browse-project-cover cover-${index % 4}" data-p="${p.id}" aria-label="View ${esc(p.title)} details"><span>Photo placeholder</span></button><div class="browse-project-info"><p class="project-tag">${esc(p.categories?.name ?? 'Interior design')}</p><h3><a href="#" data-p="${p.id}">${esc(p.title)}</a></h3><div class="browse-project-meta"><span>${Number(p.views ?? 0).toLocaleString()} views</span><span>${p.budget == null ? 'Budget on request' : `$${Number(p.budget).toLocaleString()}`}</span></div></div></article>`).join('') || '<p class="empty-state">This designer has not published any projects yet.</p>'}</div>
+          <div class="project-browser-grid">${projects.map((p, index) => `<article class="browse-project-card"><button type="button" class="browse-project-cover cover-${index % 4}" data-p="${p.id}" aria-label="View ${esc(p.title)} details" ${p.image_url ? `style="background-image:url('${esc(p.image_url)}');background-size:cover;background-position:center"` : ''}><span>${p.image_url ? '' : 'Photo placeholder'}</span></button><div class="browse-project-info"><p class="project-tag">${esc(p.categories?.name ?? 'Interior design')}</p><h3><a href="#" data-p="${p.id}">${esc(p.title)}</a></h3><div class="browse-project-meta"><span>${Number(p.views ?? 0).toLocaleString()} views</span><span>${p.budget == null ? 'Budget on request' : `$${Number(p.budget).toLocaleString()}`}</span></div></div></article>`).join('') || '<p class="empty-state">This designer has not published any projects yet.</p>'}</div>
         </div>
       </div>
       <section class="designer-profile-section designer-services-section">
         <h2>Services and areas of design</h2>
         <div class="designer-service-groups">
-          <div><h3>Services</h3><div class="designer-service-chips"><span>Service details available on request</span></div></div>
-          <div><h3>Areas of design</h3><div class="designer-service-chips">${specialties.map(specialty => `<span>${esc(specialty)}</span>`).join('') || '<span>Ask the designer about their areas of expertise</span>'}</div></div>
+          <div><h3>Services</h3><div class="designer-service-chips">${services.map(service => `<span>${esc(service)}</span>`).join('') || '<span>Service details available on request</span>'}</div></div>
+          <div><h3>Areas of design</h3><div class="designer-service-chips">${designAreas.map(area => `<span>${esc(area)}</span>`).join('') || specialties.map(specialty => `<span>${esc(specialty)}</span>`).join('') || '<span>Ask the designer about their areas of expertise</span>'}</div></div>
         </div>
       </section>
-      <section class="designer-profile-section designer-process-section">
+      ${workflowSteps.length ? `<section class="designer-profile-section designer-process-section">
         <h2>Our process</h2>
         <p class="designer-section-intro">A typical project journey. Confirm the scope and timing directly with the designer.</p>
         <ol class="designer-process-list">
-          <li><span class="designer-process-number">1</span><h3>Initial consultation</h3><p>Discuss your space, needs, goals and budget with the designer.</p><span class="designer-process-meta">Timing agreed together</span></li>
-          <li><span class="designer-process-number">2</span><h3>Concept and mood board</h3><p>Explore the design direction, colours and materials for your project.</p><span class="designer-process-meta">Scope confirmed together</span></li>
-          <li><span class="designer-process-number">3</span><h3>Design and 3D layout</h3><p>Review the proposed layout and design details for your space.</p><span class="designer-process-meta">Revisions agreed together</span></li>
-          <li><span class="designer-process-number">4</span><h3>Quotation and agreement</h3><p>Review the quotation, timeline and project agreement before work begins.</p><span class="designer-process-meta">Approval required</span></li>
-          <li><span class="designer-process-number">5</span><h3>Renovation and handover</h3><p>Coordinate the work and review the completed space with the designer.</p><span class="designer-process-meta">Timeline varies by project</span></li>
+          ${workflowSteps.map((step, index) => `<li><span class="designer-process-number">${index + 1}</span><h3>${esc(step.title)}</h3><p>${esc(step.description || '')}</p><span class="designer-process-meta">${esc(step.duration || 'Timing agreed together')}${step.approval ? ' · Client approval required' : ''}</span></li>`).join('')}
         </ol>
-      </section>
+      </section>` : ''}
       <section class="designer-profile-section designer-testimonials-section">
         <div class="designer-testimonials-heading"><div><h2>Client testimonials</h2><p class="designer-section-intro">Feedback from clients who have worked with this designer.</p></div></div>
         <p class="designer-testimonials-empty">There are no client testimonials yet.</p>
@@ -1041,15 +1153,33 @@ class App {
         message ? `Message: ${message}` : ''
       ].filter(Boolean).join('\n');
       const submit = this.$('#request-appointment');
+      const [hour, minute] = time.match(/\d+/g).map(Number);
+      const localDate = new Date(`${date}T00:00:00`);
+      localDate.setHours((hour % 12) + (time.includes('PM') ? 12 : 0), minute);
+      if (localDate <= new Date()) throw new Error('Choose a future date and time.');
       submit.disabled = true;
       let conversationId;
       try {
         conversationId = await this.inbox.startWithDesigner(profile.id, projectId ? Number(projectId) : null);
-        await this.inbox.send(conversationId, request);
+        await this.designers.createAppointmentRequest({
+          customer_id: this.user.id,
+          designer_id: profile.id,
+          project_id: projectId ? Number(projectId) : null,
+          requested_for: localDate.toISOString(),
+          request_message: message || null
+        });
+        try {
+          await this.inbox.send(conversationId, request);
+        } catch (error) {
+          appointmentDialog.close();
+          window.alert(`Your appointment request was saved, but the designer could not be notified by message: ${error.message}`);
+          return;
+        }
       } finally {
         submit.disabled = false;
       }
       appointmentDialog.close();
+      window.alert('Your appointment request has been sent.');
       await this.open('messages', conversationId);
     }));
     this.$('#main').onclick = e => {
@@ -1696,6 +1826,13 @@ class App {
 
   async dashboardView() {
     if (this.user?.role === 'admin' && !this.isReadOnlyPreview) return this.dashboardView_old();
+    if (this.user?.role === 'designer') {
+      try {
+        return await this.designerDashboardView();
+      } catch (error) {
+        this.showDesignerPage(`<div class="designer-dashboard-error err" role="alert">${esc(error.message)}</div>`, 'dashboard');
+      }
+    }
 
     const statData = [
       { label: 'New IDs today', value: 5, delta: '+1 vs yesterday' },
@@ -1801,6 +1938,764 @@ class App {
     if (fab) {
       fab.onclick = () => this.user ? this.open('messages') : this.loginView('login');
     }
+  }
+
+  async designerDashboardView() {
+    const [{ projects }, categories] = await Promise.all([
+      this.designers.designer(this.user.id),
+      this.designers.categories()
+    ]);
+    let activeFilter = 'all';
+    const categoriesById = new Map(categories.map(category => [category.id, category.name]));
+    const categoryOptions = categories.map(category =>
+      `<option value="${category.id}">${esc(category.name)}</option>`
+    ).join('');
+    const publishedProjects = projects.filter(project => project.visibility !== 'draft');
+    const totalViews = publishedProjects.reduce((total, project) => total + Number(project.views ?? 0), 0);
+    const totalShortlists = publishedProjects.reduce((total, project) => total + Number(project.shortlists ?? 0), 0);
+
+    this.show(`<section class="idp-shell designer-dashboard">
+      ${this.designerDashboardSidebar('dashboard')}
+      <div class="idp-main designer-dashboard-main">
+        <div class="designer-dashboard-heading">
+          <h1>My portfolio</h1>
+          <button type="button" class="btn designer-add-project" id="designer-add-project">+ Add project</button>
+        </div>
+        <div class="designer-dashboard-metrics">
+          <article><span>Total views</span><strong>${totalViews.toLocaleString()}</strong></article>
+          <article><span>Times shortlisted</span><strong>${totalShortlists.toLocaleString()}</strong></article>
+          <article><span>Published projects</span><strong>${publishedProjects.length.toLocaleString()}</strong></article>
+        </div>
+        <section class="designer-project-panel" aria-labelledby="designer-projects-heading">
+          <div class="designer-project-panel-heading">
+            <h2 id="designer-projects-heading">Projects</h2>
+            <div class="designer-project-filters" role="group" aria-label="Filter projects">
+              <button type="button" class="active" data-project-filter="all" aria-pressed="true">All</button>
+              <button type="button" data-project-filter="ongoing" aria-pressed="false">Ongoing</button>
+              <button type="button" data-project-filter="completed" aria-pressed="false">Completed</button>
+              <button type="button" data-project-filter="draft" aria-pressed="false">Drafts</button>
+            </div>
+          </div>
+          <label class="designer-project-search">Search projects<input id="designer-project-search" type="search" placeholder="Project title"></label>
+          <p id="designer-dashboard-error" class="err" role="alert"></p>
+          <div class="designer-project-table-wrap">
+            <table class="designer-project-table">
+              <thead><tr><th>Project</th><th>Category</th><th>Stage</th><th>Progress</th><th>Visibility</th><th>Views</th><th>Shortlisted</th><th>Actions</th></tr></thead>
+              <tbody id="designer-project-rows"></tbody>
+            </table>
+          </div>
+          <p class="designer-project-empty" id="designer-project-empty" hidden>No projects yet. Add a project to start building your portfolio.</p>
+        </section>
+      </div>
+      <dialog class="account-edit-dialog designer-project-dialog" id="designer-project-dialog" aria-labelledby="designer-project-dialog-title">
+        <form id="designer-project-form">
+          <div class="account-edit-heading"><h2 id="designer-project-dialog-title">Add a project</h2><button type="button" class="account-modal-close" id="designer-project-close" aria-label="Close dialog">×</button></div>
+          <label>Project title<input name="title" maxlength="120" required></label>
+          <label>Category<select name="category_id"><option value="">Select a category</option>${categoryOptions}</select></label>
+          <label>Budget (optional)<input name="budget" type="number" min="0" step="100" placeholder="e.g. 12000"></label>
+          <label>Stage<select name="stage"><option value="ongoing">Ongoing</option><option value="completed">Completed</option></select></label>
+          <label>Progress (%)<input name="progress" type="number" min="0" max="100" step="5" value="0" required></label>
+          <label>Visibility<select name="visibility"><option value="published">Published</option><option value="draft">Draft</option></select></label>
+          <label class="designer-project-image-field">Project image (optional)<input name="image" type="file" accept="image/*"></label>
+          <label>Description<textarea name="description" rows="5" maxlength="2000" placeholder="Describe the design style, room type and key details."></textarea></label>
+          <p class="err designer-project-dialog-error" role="alert"></p>
+          <div class="account-edit-actions"><button type="button" class="btn secondary-btn" id="designer-project-cancel">Cancel</button><button type="submit" class="btn">Save project</button></div>
+        </form>
+      </dialog>
+      <dialog class="account-edit-dialog designer-delete-dialog" id="designer-delete-dialog" aria-labelledby="designer-delete-title">
+        <form method="dialog">
+          <h2 id="designer-delete-title"></h2>
+          <p class="designer-delete-description" id="designer-delete-description"></p>
+          <p class="designer-delete-note">To keep it but hide it from customers, unpublish it instead.</p>
+          <p class="err designer-delete-error" role="alert"></p>
+          <div class="account-edit-actions">
+            <button type="button" class="btn secondary-btn" id="designer-delete-cancel">Cancel</button>
+            <button type="button" class="btn secondary-btn" id="designer-unpublish-project">Unpublish instead</button>
+            <button type="button" class="btn danger-btn" id="designer-confirm-delete">Delete project</button>
+          </div>
+        </form>
+      </dialog>
+    </section>`);
+
+    const renderProjects = () => {
+      const searchTerm = this.$('#designer-project-search').value.trim().toLowerCase();
+      const visibleProjects = projects
+        .filter(project => project.title.toLowerCase().includes(searchTerm))
+        .filter(project => activeFilter === 'all'
+          || (activeFilter === 'draft'
+            ? project.visibility === 'draft'
+            : project.visibility !== 'draft' && project.stage === activeFilter))
+        .sort((left, right) => new Date(right.created_at).getTime() - new Date(left.created_at).getTime());
+      this.$('#designer-project-rows').innerHTML = visibleProjects.map(project => `
+        <tr>
+          <td><strong>${esc(project.title)}</strong></td>
+          <td>${esc(categoriesById.get(project.category_id) ?? 'Interior design')}</td>
+          <td><span class="designer-project-stage ${project.stage === 'ongoing' ? 'ongoing' : 'completed'}">${project.stage === 'ongoing' ? 'Ongoing' : 'Completed'}</span></td>
+          <td><div class="designer-project-progress"><span><i style="width:${Math.max(0, Math.min(100, Number(project.progress ?? 0)))}%"></i></span>${Math.max(0, Math.min(100, Number(project.progress ?? 0)))}%</div></td>
+          <td><span class="designer-project-visibility ${project.visibility === 'draft' ? 'draft' : ''}">${project.visibility === 'draft' ? 'Draft' : 'Published'}</span></td>
+          <td>${Number(project.views ?? 0).toLocaleString()}</td>
+          <td>${Number(project.shortlists ?? 0).toLocaleString()}</td>
+          <td><div class="designer-project-actions"><button type="button" class="designer-project-action" data-project-edit="${project.id}">Edit</button><button type="button" class="designer-project-action" data-project-delete="${project.id}">Delete</button></div></td>
+        </tr>`).join('');
+      this.$('#designer-project-empty').hidden = visibleProjects.length > 0;
+      this.$('#designer-project-empty').textContent = projects.length
+        ? 'No matching projects. Try a different title search.'
+        : 'No projects yet. Add a project to start building your portfolio.';
+    };
+    const dialog = this.$('#designer-project-dialog');
+    const form = this.$('#designer-project-form');
+    const closeDialog = () => dialog.close();
+    const showDialog = project => {
+      form.reset();
+      this.$('.designer-project-dialog-error').textContent = '';
+      this.$('#designer-project-dialog-title').textContent = project ? 'Edit project' : 'Add a project';
+      form.elements.namedItem('title').value = project?.title ?? '';
+      form.elements.namedItem('category_id').value = project?.category_id ?? '';
+      form.elements.namedItem('budget').value = project?.budget ?? '';
+      form.elements.namedItem('description').value = project?.description ?? '';
+      form.elements.namedItem('stage').value = project?.stage ?? 'ongoing';
+      form.elements.namedItem('progress').value = project?.progress ?? 0;
+      form.elements.namedItem('visibility').value = project?.visibility ?? 'published';
+      form.elements.namedItem('image').closest('label').hidden = Boolean(project);
+      form.dataset.projectId = project?.id ?? '';
+      dialog.showModal();
+      form.elements.namedItem('title').focus();
+    };
+    const rowById = id => projects.find(project => String(project.id) === String(id));
+
+    this.$('#designer-add-project').onclick = () => showDialog(null);
+    this.$('#designer-project-close').onclick = closeDialog;
+    this.$('#designer-project-cancel').onclick = closeDialog;
+    dialog.addEventListener('click', event => { if (event.target === dialog) closeDialog(); });
+    const deleteDialog = this.$('#designer-delete-dialog');
+    let projectPendingDelete = null;
+    const closeDeleteDialog = () => {
+      deleteDialog.close();
+      projectPendingDelete = null;
+    };
+    this.$('#designer-delete-cancel').onclick = closeDeleteDialog;
+    deleteDialog.addEventListener('click', event => { if (event.target === deleteDialog) closeDeleteDialog(); });
+    this.$('#designer-unpublish-project').onclick = async () => {
+      projectPendingDelete = this._pendingDesignerProjectDelete;
+      if (!projectPendingDelete) return;
+      try {
+        await this.designers.updateProject(projectPendingDelete.id, this.user.id, { visibility: 'draft' });
+        closeDeleteDialog();
+        this._pendingDesignerProjectDelete = null;
+        await this.designerDashboardView();
+      } catch (error) {
+        this.$('.designer-delete-error').textContent = error.message;
+      }
+    };
+    this.$('#designer-confirm-delete').onclick = async () => {
+      projectPendingDelete = this._pendingDesignerProjectDelete;
+      if (!projectPendingDelete) return;
+      try {
+        const cleanupWarning = await this.designers.deleteProject(projectPendingDelete.id, this.user.id);
+        closeDeleteDialog();
+        this._pendingDesignerProjectDelete = null;
+        await this.designerDashboardView();
+        if (cleanupWarning) this.$('#designer-dashboard-error').textContent = cleanupWarning;
+      } catch (error) {
+        this.$('.designer-delete-error').textContent = error.message;
+      }
+    };
+    form.onsubmit = async event => {
+      event.preventDefault();
+      const data = Object.fromEntries(new FormData(form));
+      const title = String(data.title ?? '').trim();
+      const budget = data.budget === '' ? null : Number(data.budget);
+      if (!title) {
+        this.$('.designer-project-dialog-error').textContent = 'Project title is required.';
+        return;
+      }
+      if (budget !== null && (!Number.isFinite(budget) || budget < 0)) {
+        this.$('.designer-project-dialog-error').textContent = 'Budget must be a valid non-negative number.';
+        return;
+      }
+      if (!Number.isFinite(Number(data.progress)) || Number(data.progress) < 0 || Number(data.progress) > 100) {
+        this.$('.designer-project-dialog-error').textContent = 'Progress must be between 0 and 100.';
+        return;
+      }
+      const fields = {
+        title,
+        description: String(data.description ?? '').trim() || null,
+        category_id: data.category_id ? Number(data.category_id) : null,
+        budget,
+        stage: data.stage,
+        progress: Number(data.progress),
+        visibility: data.visibility
+      };
+      try {
+        if (form.dataset.projectId) {
+          await this.designers.updateProject(form.dataset.projectId, this.user.id, fields);
+        } else {
+          await this.designers.createProject({
+            ...fields,
+            designer_id: this.user.id
+          }, form.elements.namedItem('image').files?.[0] ?? null);
+        }
+        closeDialog();
+        await this.designerDashboardView();
+      } catch (error) {
+        this.$('.designer-project-dialog-error').textContent = error.message;
+      }
+    };
+    this.$('.designer-project-filters').onclick = event => {
+      const button = event.target.closest('[data-project-filter]');
+      if (!button) return;
+      activeFilter = button.dataset.projectFilter;
+      this.$$('.designer-project-filters button').forEach(filter => {
+        const selected = filter === button;
+        filter.classList.toggle('active', selected);
+        filter.setAttribute('aria-pressed', String(selected));
+      });
+      renderProjects();
+    };
+    this.$('#designer-project-search').oninput = renderProjects;
+    this.$('.designer-project-table').onclick = async event => {
+      const editButton = event.target.closest('[data-project-edit]');
+      const deleteButton = event.target.closest('[data-project-delete]');
+      if (editButton) {
+        const project = rowById(editButton.dataset.projectEdit);
+        if (project) showDialog(project);
+      } else if (deleteButton) {
+        const project = rowById(deleteButton.dataset.projectDelete);
+        if (project) this.showProjectDeleteDialog(project);
+      }
+    };
+    this.$('.designer-dashboard-sidebar').onclick = event => {
+      const button = event.target.closest('[data-designer-view]');
+      if (button) this.openDesignerDashboardView(button.dataset.designerView);
+    };
+    renderProjects();
+  }
+
+  showProjectDeleteDialog(project) {
+    const dialog = this.$('#designer-delete-dialog');
+    this.$('#designer-delete-title').textContent = `Delete "${project.title}"?`;
+    this.$('#designer-delete-description').textContent =
+      `This permanently removes the project, its photos, ${Number(project.views ?? 0).toLocaleString()} views and ${Number(project.shortlists ?? 0).toLocaleString()} favourites. This cannot be undone.`;
+    this.$('.designer-delete-error').textContent = '';
+    this.$('#designer-unpublish-project').hidden = project.visibility === 'draft';
+    dialog.dataset.projectId = project.id;
+    dialog.showModal();
+    this.$('#designer-delete-cancel').focus();
+    this._pendingDesignerProjectDelete = project;
+  }
+
+  async companyInformationView() {
+    const { profile, company } = await this.designers.designer(this.user.id);
+    const categories = await this.designers.categories();
+    const specialties = Array.isArray(company?.specialties) ? company.specialties : [];
+    const designAreas = Array.isArray(company?.design_areas) ? company.design_areas : [];
+    const services = company?.services ?? '';
+    const areas = ['Living room', 'Bedroom', 'Kitchen', 'Bathroom', 'Home office', 'Outdoor'];
+    const specialtyInputs = categories.map(category => `
+      <label class="designer-check"><input type="checkbox" name="specialties" value="${esc(category.name)}" ${specialties.includes(category.name) ? 'checked' : ''}><span>${esc(category.name)}</span></label>`).join('');
+    const areaInputs = areas.map(area => `
+      <label class="designer-check"><input type="checkbox" name="design_areas" value="${area}" ${designAreas.includes(area) ? 'checked' : ''}><span>${area}</span></label>`).join('');
+    this.showDesignerPage(`
+      <div class="designer-page-heading">
+        <div><h1>Company profile</h1><p>This is what customers see on your public company page.</p></div>
+        <button type="button" class="designer-outline-button" id="view-public-profile">View public profile</button>
+      </div>
+      <div class="designer-company-tabs" role="tablist" aria-label="Company profile sections">
+        <button type="button" class="active" id="company-information-tab" role="tab" aria-selected="true">Company information</button>
+        <button type="button" id="company-preview-toggle" role="tab" aria-selected="false">Public preview</button>
+      </div>
+      <div class="designer-company-preview" id="company-preview" hidden></div>
+      <form class="designer-company-form" id="designer-company-form">
+        <section class="designer-form-card">
+          <h2>Branding</h2>
+          <div class="designer-branding-grid">
+            <div class="designer-branding-logo"><span>Logo</span><div><img class="designer-brand-preview logo" src="${esc(company?.logo_url ?? '')}" alt="Company logo" ${company?.logo_url ? '' : 'hidden'}><span class="designer-brand-placeholder" ${company?.logo_url ? 'hidden' : ''}></span><label for="company-logo-upload" class="designer-outline-button">${company?.logo_url ? 'Change logo' : 'Add logo'}</label><input id="company-logo-upload" class="designer-upload-input" type="file" name="logo" accept="image/*"></div></div>
+            <div class="designer-branding-cover"><span>Cover photo</span><label for="company-cover-upload">${company?.cover_url ? `<img class="designer-brand-preview cover" src="${esc(company.cover_url)}" alt="Current company cover photo">` : '<span>Upload a cover photo</span>'}<input id="company-cover-upload" class="designer-upload-input" type="file" name="cover" accept="image/*"></label></div>
+          </div>
+        </section>
+        <section class="designer-form-card designer-company-details">
+          <h2>Company information</h2>
+          <div class="designer-form-grid">
+            <label>Company name<input name="name" maxlength="120" value="${esc(company?.name ?? profile.name)}" required></label>
+            <label>Year established<input name="year_established" type="number" min="1800" max="${new Date().getFullYear()}" value="${esc(company?.year_established ?? '')}" placeholder="e.g. 2015"></label>
+            <label class="designer-form-full">Tagline<input name="tagline" maxlength="160" value="${esc(company?.tagline ?? '')}" placeholder="A short introduction"></label>
+            <label class="designer-form-full">About the company<textarea name="bio" rows="3" maxlength="2000">${esc(company?.bio ?? '')}</textarea></label>
+            <fieldset class="designer-form-full"><legend>Specialties</legend><div class="designer-check-list">${specialtyInputs || '<span class="muted">Add categories to select specialties.</span>'}</div></fieldset>
+          </div>
+        </section>
+        <section class="designer-form-card">
+          <h2>Services offered</h2>
+          <label>Services offered (one per line)<textarea name="services" rows="3" maxlength="2000">${esc(services)}</textarea></label>
+          <fieldset><legend>Areas of design</legend><div class="designer-check-list">${areaInputs}</div></fieldset>
+        </section>
+        <section class="designer-form-card">
+          <h2>Contact details</h2>
+          <div class="designer-form-grid">
+            <label>Email<input name="email" type="email" maxlength="254" value="${esc(company?.email ?? this.user.email ?? '')}"></label>
+            <label>Phone<input name="phone" type="tel" maxlength="40" value="${esc(company?.phone ?? '')}"></label>
+            <label>Website<input name="website" type="url" maxlength="300" value="${esc(company?.website ?? '')}" placeholder="https://"></label>
+            <label>Address<input name="address" maxlength="300" value="${esc(company?.address ?? '')}"></label>
+          </div>
+        </section>
+        <p class="err designer-company-error" role="alert"></p>
+        <div class="designer-company-actions"><button class="designer-outline-button" id="discard-company-changes" type="button">Discard changes</button><button class="btn designer-save-button" type="submit">Save changes</button></div>
+      </form>
+    `, 'company', 'designer-company-page');
+    const form = this.$('#designer-company-form');
+    const preview = this.$('#company-preview');
+    const companyTab = this.$('#company-information-tab');
+    const previewTab = this.$('#company-preview-toggle');
+    const switchCompanyTab = showPreview => {
+      preview.hidden = !showPreview;
+      form.hidden = showPreview;
+      companyTab.classList.toggle('active', !showPreview);
+      companyTab.setAttribute('aria-selected', String(!showPreview));
+      previewTab.classList.toggle('active', showPreview);
+      previewTab.setAttribute('aria-selected', String(showPreview));
+    };
+    companyTab.onclick = () => switchCompanyTab(false);
+    this.$('#view-public-profile').onclick = () => this.designerView(profile.id);
+    this.$('#discard-company-changes').onclick = () => {
+      form.reset();
+      logoImage.src = company?.logo_url ?? '';
+      logoImage.hidden = !company?.logo_url;
+      this.$('.designer-brand-placeholder').hidden = Boolean(company?.logo_url);
+      const coverLabel = coverInput.closest('label');
+      coverLabel.querySelector('.designer-brand-preview')?.remove();
+      coverLabel.querySelector('span')?.remove();
+      if (company?.cover_url) {
+        const image = document.createElement('img');
+        image.className = 'designer-brand-preview cover';
+        image.src = company.cover_url;
+        image.alt = 'Current company cover photo';
+        coverLabel.prepend(image);
+      } else {
+        const placeholder = document.createElement('span');
+        placeholder.textContent = 'Upload a cover photo';
+        coverLabel.prepend(placeholder);
+      }
+      this.$('.designer-company-error').textContent = '';
+    };
+    const logoInput = this.$('#company-logo-upload');
+    const logoImage = this.$('.designer-brand-preview.logo');
+    logoInput.onchange = () => {
+      const file = logoInput.files[0];
+      if (!file) return;
+      logoImage.src = URL.createObjectURL(file);
+      logoImage.hidden = false;
+      this.$('.designer-brand-placeholder').hidden = true;
+    };
+    const coverInput = this.$('#company-cover-upload');
+    coverInput.onchange = () => {
+      const file = coverInput.files[0];
+      if (!file) return;
+      const coverLabel = coverInput.closest('label');
+      coverLabel.querySelector('.designer-brand-preview')?.remove();
+      coverLabel.querySelector('span')?.remove();
+      const image = document.createElement('img');
+      image.className = 'designer-brand-preview cover';
+      image.alt = 'Selected company cover photo';
+      image.src = URL.createObjectURL(file);
+      coverLabel.prepend(image);
+    };
+    this.$('#company-preview-toggle').onclick = () => {
+      const values = new FormData(form);
+      const checked = name => values.getAll(name).map(value => String(value));
+      preview.innerHTML = `<h2>${esc(values.get('name') || 'Company name')}</h2>
+        <p>${esc(values.get('tagline') || '')}</p>
+        <p>${esc(values.get('bio') || 'Add a company description to preview it here.')}</p>
+        <p><strong>Specialties:</strong> ${esc(checked('specialties').join(', ') || 'None selected')}</p>
+        <p><strong>Services:</strong> ${esc(String(values.get('services') || '').split('\n').filter(Boolean).join(' · ') || 'None listed')}</p>
+        <p><strong>Areas:</strong> ${esc(checked('design_areas').join(', ') || 'None selected')}</p>`;
+      switchCompanyTab(true);
+    };
+    form.onsubmit = async event => {
+      event.preventDefault();
+      const values = new FormData(form);
+      const year = String(values.get('year_established') ?? '').trim();
+      const yearEstablished = year ? Number(year) : null;
+      if (yearEstablished !== null && (!Number.isInteger(yearEstablished) || yearEstablished < 1800 || yearEstablished > new Date().getFullYear())) {
+        this.$('.designer-company-error').textContent = 'Enter a valid year established.';
+        return;
+      }
+      const submit = form.querySelector('[type="submit"]');
+      submit.disabled = true;
+      this.$('.designer-company-error').textContent = '';
+      try {
+        const [logoUrl, coverUrl] = await Promise.all([
+          this.designers.uploadCompanyAsset(this.user.id, 'logo', form.elements.namedItem('logo').files[0]),
+          this.designers.uploadCompanyAsset(this.user.id, 'cover', form.elements.namedItem('cover').files[0])
+        ]);
+        await this.designers.saveCompany(this.user.id, {
+          name: String(values.get('name')).trim(),
+          tagline: String(values.get('tagline') ?? '').trim() || null,
+          year_established: yearEstablished,
+          bio: String(values.get('bio') ?? '').trim() || null,
+          specialties: values.getAll('specialties'),
+          services: String(values.get('services') ?? '').trim() || null,
+          design_areas: values.getAll('design_areas'),
+          email: String(values.get('email') ?? '').trim() || null,
+          phone: String(values.get('phone') ?? '').trim() || null,
+          website: String(values.get('website') ?? '').trim() || null,
+          address: String(values.get('address') ?? '').trim() || null,
+          ...(logoUrl ? { logo_url: logoUrl } : {}),
+          ...(coverUrl ? { cover_url: coverUrl } : {})
+        });
+        await this.companyInformationView();
+      } catch (error) {
+        this.$('.designer-company-error').textContent = error.message;
+      } finally {
+        submit.disabled = false;
+      }
+    };
+  }
+
+  async interestInsightsView() {
+    const [{ projects }, activity] = await Promise.all([
+      this.designers.designer(this.user.id),
+      this.designers.designerActivity(this.user.id)
+    ]);
+    const publishedProjects = projects.filter(project => project.visibility !== 'draft');
+    const categories = await this.designers.categories();
+    const categoriesById = new Map(categories.map(category => [category.id, category.name]));
+    const totalViews = publishedProjects.reduce((total, project) => total + Number(project.views ?? 0), 0);
+    const totalShortlists = publishedProjects.reduce((total, project) => total + Number(project.shortlists ?? 0), 0);
+    let range = '7';
+    let sort = 'views';
+    const today = new Date();
+    const dateKey = date => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+    const renderInsights = () => {
+      const days = range === '30' ? 30 : range === '7' ? 7 : null;
+      const cutoff = days ? new Date(today) : null;
+      if (cutoff) cutoff.setDate(cutoff.getDate() - (days - 1));
+      const recentActivity = activity.filter(row => row.activity_type === 'view' && (!cutoff || new Date(row.created_at) >= cutoff));
+      const daily = new Map();
+      for (const row of recentActivity) {
+        const key = dateKey(new Date(row.created_at));
+        daily.set(key, (daily.get(key) ?? 0) + 1);
+      }
+      const labels = days
+        ? Array.from({ length: days }, (_, index) => {
+          const date = new Date(today);
+          date.setDate(date.getDate() - (days - 1 - index));
+          return date;
+        })
+        : (() => {
+          const first = activity.length ? new Date(activity[0].created_at) : new Date(today.getFullYear(), today.getMonth(), 1);
+          const start = new Date(first.getFullYear(), first.getMonth(), 1);
+          const count = Math.min(12, Math.max(1, (today.getFullYear() - start.getFullYear()) * 12 + today.getMonth() - start.getMonth() + 1));
+          return Array.from({ length: count }, (_, index) => new Date(today.getFullYear(), today.getMonth() - count + index + 1, 1));
+        })();
+      const values = labels.map(date => {
+        if (days) return daily.get(dateKey(date)) ?? 0;
+        const month = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
+        return recentActivity.filter(row => row.created_at.startsWith(month)).length;
+      });
+      this.$('#insights-chart-title').textContent = days ? 'Views per day' : 'Views by month';
+      const max = Math.max(1, ...values);
+      const projectRows = [...publishedProjects].sort((a, b) => sort === 'shortlists'
+        ? Number(b.shortlists ?? 0) - Number(a.shortlists ?? 0)
+        : Number(b.views ?? 0) - Number(a.views ?? 0));
+      this.$('#insights-chart').innerHTML = labels.map((date, index) => `
+        <div class="designer-insight-bar"><strong>${values[index]}</strong><span style="height:${Math.max(3, values[index] / max * 100)}%"></span><small>${days ? date.toLocaleDateString(undefined, { weekday: 'short' }) : date.toLocaleDateString(undefined, { month: 'short' })}</small></div>`).join('');
+      this.$('#insights-projects').innerHTML = projectRows.map(project => {
+        const views = Number(project.views ?? 0);
+        const shortlists = Number(project.shortlists ?? 0);
+        return `<tr><td><strong>${esc(project.title)}</strong></td><td>${esc(categoriesById.get(project.category_id) ?? 'Interior design')}</td><td>${views.toLocaleString()}</td><td>${shortlists.toLocaleString()}</td><td>${views ? `${(shortlists / views * 100).toFixed(1)}%` : '—'}</td></tr>`;
+      }).join('') || '<tr><td colspan="5" class="designer-insights-empty">Add projects to see their engagement.</td></tr>';
+      this.$('#insight-range-note').textContent = 'Daily view history starts when this dashboard migration is applied; existing project totals are shown above.';
+    };
+    this.showDesignerPage(`
+      <div class="designer-page-heading"><div><h1>Interest insights</h1><p>See how customers find and shortlist your projects.</p></div>
+        <div class="designer-insight-range" role="group" aria-label="View history range"><button class="active" data-range="7">Last 7 days</button><button data-range="30">Last 30 days</button><button data-range="all">All time</button></div>
+      </div>
+      <div class="designer-insight-metrics">
+        <article><span>Total views</span><strong>${totalViews.toLocaleString()}</strong><small>All time</small></article>
+        <article><span>Times shortlisted</span><strong>${totalShortlists.toLocaleString()}</strong><small>Added to favourites</small></article>
+        <article><span>Shortlist rate</span><strong>${totalViews ? `${(totalShortlists / totalViews * 100).toFixed(1)}%` : '0%'}</strong><small>Shortlists per view</small></article>
+      </div>
+      <section class="designer-insight-highlight"><span>Top project</span><strong>${esc([...publishedProjects].sort((a, b) => Number(b.views ?? 0) - Number(a.views ?? 0))[0]?.title ?? 'No projects yet')}</strong><small>${Number([...publishedProjects].sort((a, b) => Number(b.views ?? 0) - Number(a.views ?? 0))[0]?.views ?? 0).toLocaleString()} views</small></section>
+      <section class="designer-insight-card"><h2 id="insights-chart-title">Views per day</h2><div class="designer-insight-chart" id="insights-chart"></div></section>
+      <section class="designer-insight-card"><div class="designer-insight-table-heading"><h2>By project</h2><label>Sort by<select id="insights-sort"><option value="views">Most viewed</option><option value="shortlists">Most shortlisted</option></select></label></div>
+        <div class="designer-project-table-wrap"><table class="designer-insights-table"><thead><tr><th>Project</th><th>Category</th><th>Views</th><th>Shortlisted</th><th>Shortlist rate</th></tr></thead><tbody id="insights-projects"></tbody></table></div>
+      </section>
+      <p class="designer-insight-note" id="insight-range-note"></p>
+    `, 'insights');
+    renderInsights();
+    this.$('.designer-insight-range').onclick = event => {
+      const button = event.target.closest('[data-range]');
+      if (!button) return;
+      range = button.dataset.range;
+      this.$$('.designer-insight-range button').forEach(item => item.classList.toggle('active', item === button));
+      renderInsights();
+    };
+    this.$('#insights-sort').onchange = event => {
+      sort = event.target.value;
+      renderInsights();
+    };
+  }
+
+  async processWorkflowView() {
+    const { company } = await this.designers.designer(this.user.id);
+    const templates = {
+      standard: [
+        ['Initial consultation', '1 week', true, 'Meet the client, listen to their needs and agree the scope.'],
+        ['Concept and mood board', '1–2 weeks', true, 'Describe the style direction, colours and materials you propose.'],
+        ['Design and 3D layout', '2–3 weeks', true, 'Prepare floor plans, 3D views and material selections.'],
+        ['Quotation and agreement', '1 week', true, 'Present the quotation, timeline and contract for signing.'],
+        ['Renovation and handover', 'Varies', false, 'Coordinate site work, progress updates and the final walk-through.']
+      ],
+      compact: [
+        ['Discovery', '1 week', true, 'Understand the client goals, space and budget.'],
+        ['Design proposal', '2 weeks', true, 'Share the proposed layout, materials and quotation.'],
+        ['Delivery and handover', 'Varies', false, 'Complete the work and walk through the finished space.']
+      ]
+    };
+    let steps = Array.isArray(company?.workflow_steps) && company.workflow_steps.length
+      ? company.workflow_steps.map(step => ({ title: step.title ?? '', duration: step.duration ?? '', approval: Boolean(step.approval), description: step.description ?? '' }))
+      : templates.standard.map(([title, duration, approval, description]) => ({ title, duration, approval, description }));
+    this.showDesignerPage(`
+      <div class="designer-page-heading"><div><h1>Process workflow</h1><p>Show clients how you work, step by step, so you and your clients stay aligned.</p></div>
+        <div class="designer-workflow-actions"><button type="button" class="designer-outline-button" id="workflow-preview">Preview as client</button><button type="submit" form="designer-workflow-form" class="btn designer-add-project">Save changes</button></div>
+      </div>
+      <form id="designer-workflow-form" class="designer-workflow-form">
+        <div class="designer-workflow-toolbar"><label>Start from a template<select id="workflow-template"><option value="">Choose a template</option><option value="standard">Interior design project</option><option value="compact">Short project</option></select></label><button type="button" class="designer-outline-button" id="workflow-add-step">+ Add step</button></div>
+        <div class="designer-workflow-steps" id="workflow-steps"></div>
+        <section class="designer-form-card designer-workflow-sharing"><h2>Share with clients</h2><label class="designer-check"><input type="checkbox" name="workflow_public" ${company?.workflow_public ? 'checked' : ''}><span>Show this process on my public company profile</span></label>
+          <p class="muted">Your workflow will appear on your public company profile when enabled.</p></section>
+        <p class="err designer-workflow-error" role="alert"></p><p class="designer-workflow-success" role="status"></p>
+      </form>
+      <dialog class="account-edit-dialog designer-workflow-preview-dialog" id="workflow-preview-dialog"><form method="dialog"><div class="account-edit-heading"><h2>Client preview</h2><button class="account-modal-close" aria-label="Close preview">×</button></div><div id="workflow-preview-content"></div></form></dialog>
+    `, 'workflow');
+    const list = this.$('#workflow-steps');
+    const renderSteps = () => {
+      list.innerHTML = steps.map((step, index) => `
+        <article class="designer-workflow-step" data-step-index="${index}">
+          <div class="designer-workflow-step-heading"><span class="designer-workflow-number">${index + 1}</span><strong>Step ${index + 1}</strong><button type="button" class="designer-outline-button" data-move-step="${index}" data-direction="-1" aria-label="Move step up" ${index === 0 ? 'disabled' : ''}>↑</button><button type="button" class="designer-outline-button" data-move-step="${index}" data-direction="1" aria-label="Move step down" ${index === steps.length - 1 ? 'disabled' : ''}>↓</button><button type="button" class="designer-outline-button" data-remove-step="${index}">Remove</button></div>
+          <div class="designer-workflow-fields">
+            <label>Step title<input name="title" maxlength="100" value="${esc(step.title)}" required></label>
+            <label>Typical duration<input name="duration" maxlength="60" value="${esc(step.duration)}" placeholder="e.g. 1–2 weeks"></label>
+            <label class="designer-check"><input name="approval" type="checkbox" ${step.approval ? 'checked' : ''}><span>Needs client approval</span></label>
+            <label class="designer-workflow-description">What happens in this step<textarea name="description" rows="2" maxlength="1000" placeholder="Describe this step">${esc(step.description)}</textarea></label>
+          </div>
+        </article>`).join('');
+    };
+    renderSteps();
+    list.oninput = () => {
+      steps = [...list.querySelectorAll('.designer-workflow-step')].map(card => ({
+        title: card.querySelector('[name="title"]').value,
+        duration: card.querySelector('[name="duration"]').value,
+        approval: card.querySelector('[name="approval"]').checked,
+        description: card.querySelector('[name="description"]').value
+      }));
+    };
+    list.onclick = event => {
+      const remove = event.target.closest('[data-remove-step]');
+      const move = event.target.closest('[data-move-step]');
+      if (remove) {
+        steps.splice(Number(remove.dataset.removeStep), 1);
+      } else if (move) {
+        const index = Number(move.dataset.moveStep);
+        const nextIndex = index + Number(move.dataset.direction);
+        [steps[index], steps[nextIndex]] = [steps[nextIndex], steps[index]];
+      } else return;
+      renderSteps();
+    };
+    this.$('#workflow-add-step').onclick = () => {
+      steps.push({ title: '', duration: '', approval: false, description: '' });
+      renderSteps();
+      list.lastElementChild.querySelector('[name="title"]').focus();
+    };
+    this.$('#workflow-template').onchange = event => {
+      if (templates[event.target.value]) {
+        steps = templates[event.target.value].map(([title, duration, approval, description]) => ({ title, duration, approval, description }));
+        renderSteps();
+      }
+    };
+    const updateSteps = () => {
+      steps = [...list.querySelectorAll('.designer-workflow-step')].map(card => ({
+        title: card.querySelector('[name="title"]').value.trim(),
+        duration: card.querySelector('[name="duration"]').value.trim(),
+        approval: card.querySelector('[name="approval"]').checked,
+        description: card.querySelector('[name="description"]').value.trim()
+      }));
+    };
+    this.$('#workflow-preview').onclick = () => {
+      updateSteps();
+      this.$('#workflow-preview-content').innerHTML = steps.map((step, index) => `<article class="designer-workflow-preview-step"><strong>${index + 1}. ${esc(step.title || 'Untitled step')}</strong><p>${esc(step.description || 'No description provided.')}</p><small>${esc(step.duration || 'Timing agreed together')}${step.approval ? ' · Client approval required' : ''}</small></article>`).join('') || '<p>Add workflow steps to preview them.</p>';
+      this.$('#workflow-preview-dialog').showModal();
+    };
+    this.$('#designer-workflow-form').onsubmit = async event => {
+      event.preventDefault();
+      updateSteps();
+      if (!steps.length || steps.some(step => !step.title)) {
+        this.$('.designer-workflow-error').textContent = 'Add at least one step and give each step a title.';
+        return;
+      }
+      const button = this.$('[form="designer-workflow-form"][type="submit"]');
+      button.disabled = true;
+      this.$('.designer-workflow-error').textContent = '';
+      try {
+        await this.designers.saveCompany(this.user.id, {
+          workflow_steps: steps,
+          workflow_public: this.$('#designer-workflow-form [name="workflow_public"]').checked
+        });
+        this.$('.designer-workflow-success').textContent = 'Workflow saved.';
+      } catch (error) {
+        this.$('.designer-workflow-error').textContent = error.message;
+      } finally {
+        button.disabled = false;
+      }
+    };
+  }
+
+  async designerAppointmentsView() {
+    const records = await this.designers.designerAppointments(this.user.id);
+    const pending = records.filter(record => record.status === 'pending');
+    const upcoming = records.filter(record => ['accepted', 'proposed'].includes(record.status));
+    const history = records.filter(record => ['declined', 'cancelled'].includes(record.status));
+    const formatAppointmentDate = value => new Date(value).toLocaleString(undefined, {
+      weekday: 'short', month: 'short', day: 'numeric', year: 'numeric',
+      hour: 'numeric', minute: '2-digit'
+    });
+    const appointmentCard = (record, section) => `<article class="designer-appointment-card">
+      <div class="designer-appointment-main">
+        <div class="designer-appointment-heading"><h3>${esc(record.customer?.name || 'Customer')}</h3><span class="designer-appointment-status ${esc(record.status)}">${record.status === 'proposed' ? 'Awaiting confirmation' : esc(record.status)}</span></div>
+        <p class="designer-appointment-date">${formatAppointmentDate(record.requested_for)}</p>
+        ${record.project?.title ? `<p class="designer-appointment-project">Interested in: ${esc(record.project.title)}</p>` : ''}
+        ${record.request_message ? `<p class="designer-appointment-message">${esc(record.request_message)}</p>` : ''}
+        ${record.response_message ? `<p class="designer-appointment-response">${esc(record.response_message)}</p>` : ''}
+      </div>
+      <div class="designer-appointment-actions">
+        ${section === 'pending' ? `<button type="button" class="btn" data-appointment-action="accept" data-appointment-id="${record.id}">Accept</button>
+          <button type="button" class="designer-outline-button" data-appointment-action="propose" data-appointment-id="${record.id}">Suggest another time</button>
+          <button type="button" class="designer-outline-button" data-appointment-action="decline" data-appointment-id="${record.id}">Decline</button>` : ''}
+        ${section === 'upcoming' ? `${record.status === 'accepted' ? `<button type="button" class="designer-outline-button" data-appointment-action="reschedule" data-appointment-id="${record.id}">Reschedule</button>` : ''}
+          <button type="button" class="designer-outline-button" data-appointment-action="cancel" data-appointment-id="${record.id}">Cancel</button>` : ''}
+      </div>
+    </article>`;
+    this.showDesignerPage(`<div class="designer-page-heading"><div><h1>Appointments</h1><p>Review appointment requests and manage your upcoming meetings.</p></div></div>
+      <section class="designer-appointments-section"><div class="designer-appointments-section-heading"><h2>New requests</h2><span>${pending.length}</span></div>
+        <div class="designer-appointments-list">${pending.map(record => appointmentCard(record, 'pending')).join('') || '<p class="designer-appointments-empty">You have no new appointment requests.</p>'}</div>
+      </section>
+      <section class="designer-appointments-section"><div class="designer-appointments-section-heading"><h2>Upcoming</h2><span>${upcoming.length}</span></div>
+        <div class="designer-appointments-list">${upcoming.map(record => appointmentCard(record, 'upcoming')).join('') || '<p class="designer-appointments-empty">No upcoming appointments yet.</p>'}</div>
+      </section>
+      ${history.length ? `<section class="designer-appointments-section"><div class="designer-appointments-section-heading"><h2>Past requests</h2><span>${history.length}</span></div><div class="designer-appointments-list">${history.map(record => appointmentCard(record, 'history')).join('')}</div></section>` : ''}
+      <dialog class="account-edit-dialog designer-appointment-dialog" id="appointment-action-dialog">
+        <form id="appointment-action-form"><h2 id="appointment-action-title"></h2>
+          <label for="appointment-action-date">Date<input id="appointment-action-date" type="date" required></label>
+          <label for="appointment-action-time">Time<input id="appointment-action-time" type="time" required></label>
+          <label for="appointment-action-message">Message (optional)<textarea id="appointment-action-message" maxlength="1000"></textarea></label>
+          <p id="appointment-action-error" class="err" role="alert"></p>
+          <div class="account-edit-actions"><button type="button" class="btn secondary-btn" id="appointment-action-cancel">Back</button><button type="submit" class="btn" id="appointment-action-submit">Send</button></div>
+        </form>
+      </dialog>
+      <p class="err designer-appointments-error" id="designer-appointments-error" role="alert"></p>`, 'appointments');
+    const page = this.$('.designer-dashboard-main');
+    const dialog = this.$('#appointment-action-dialog');
+    let activeRecord;
+    let activeAction;
+    const openActionDialog = (record, action) => {
+      activeRecord = record;
+      activeAction = action;
+      const current = new Date(record.requested_for);
+      this.$('#appointment-action-title').textContent = action === 'propose' ? 'Suggest another time' : 'Reschedule appointment';
+      this.$('#appointment-action-submit').textContent = action === 'propose' ? 'Suggest time' : 'Save new time';
+      this.$('#appointment-action-date').value = `${current.getFullYear()}-${String(current.getMonth() + 1).padStart(2, '0')}-${String(current.getDate()).padStart(2, '0')}`;
+      this.$('#appointment-action-time').value = `${String(current.getHours()).padStart(2, '0')}:${String(current.getMinutes()).padStart(2, '0')}`;
+      this.$('#appointment-action-message').value = '';
+      this.$('#appointment-action-error').textContent = '';
+      dialog.showModal();
+    };
+    page.onclick = async event => {
+      const button = event.target.closest('[data-appointment-action]');
+      if (!button) return;
+      const record = records.find(item => String(item.id) === button.dataset.appointmentId);
+      if (!record) return;
+      const action = button.dataset.appointmentAction;
+      if (action === 'propose' || action === 'reschedule') {
+        openActionDialog(record, action);
+        return;
+      }
+      button.disabled = true;
+      this.$('#designer-appointments-error').textContent = '';
+      try {
+        const fields = action === 'accept' ? { status: 'accepted', response_message: null }
+          : action === 'decline' ? { status: 'declined' }
+            : { status: 'cancelled' };
+        await this.designers.updateAppointment(record.id, this.user.id, fields);
+        await this.designerAppointmentsView();
+      } catch (error) {
+        button.disabled = false;
+        this.$('#designer-appointments-error').textContent = error.message;
+      }
+    };
+    this.$('#appointment-action-cancel').onclick = () => dialog.close();
+    this.$('#appointment-action-form').onsubmit = async event => {
+      event.preventDefault();
+      const submit = this.$('#appointment-action-submit');
+      submit.disabled = true;
+      this.$('#appointment-action-error').textContent = '';
+      try {
+        const date = this.$('#appointment-action-date').value;
+        const time = this.$('#appointment-action-time').value;
+        const scheduled = new Date(`${date}T${time}`);
+        if (Number.isNaN(scheduled.getTime()) || scheduled <= new Date()) {
+          throw new Error('Choose a future date and time.');
+        }
+        await this.designers.updateAppointment(activeRecord.id, this.user.id, {
+          requested_for: scheduled.toISOString(),
+          status: activeAction === 'propose' ? 'proposed' : 'accepted',
+          response_message: this.$('#appointment-action-message').value.trim() || null
+        });
+        dialog.close();
+        await this.designerAppointmentsView();
+      } catch (error) {
+        this.$('#appointment-action-error').textContent = error.message;
+      } finally {
+        submit.disabled = false;
+      }
+    };
+  }
+
+  openDesignerDashboardView(view) {
+    const views = {
+      dashboard: () => this.designerDashboardView(),
+      company: () => this.companyInformationView(),
+      insights: () => this.interestInsightsView(),
+      appointments: () => this.designerAppointmentsView(),
+      workflow: () => this.processWorkflowView()
+    };
+    const render = views[view];
+    if (!render) return;
+    render().catch(error => {
+      this.showDesignerPage(`<div class="designer-dashboard-error err" role="alert">${esc(error.message)}</div>`, view);
+    });
+  }
+
+  designerDashboardSidebar(active) {
+    const links = [
+      ['company', 'Company information'],
+      ['dashboard', 'Portfolio (IDPs)'],
+      ['insights', 'Interest insights'],
+      ['appointments', 'Appointments'],
+      ['workflow', 'Process workflow']
+    ];
+    return `<aside class="idp-sidebar designer-dashboard-sidebar" aria-label="Designer dashboard sections">
+      <nav class="designer-dashboard-nav">${links.map(([key, label]) => `
+        <button type="button" class="designer-dashboard-nav-item ${active === key ? 'active' : ''}"
+          data-designer-view="${key}"${active === key ? ' aria-current="page"' : ''}>${label}</button>`).join('')}
+      </nav>
+    </aside>`;
+  }
+
+  showDesignerPage(content, active, modifier = '') {
+    this.show(`<section class="idp-shell designer-dashboard ${modifier}">${this.designerDashboardSidebar(active)}<div class="idp-main designer-dashboard-main">${content}</div></section>`);
+    this.$('.designer-dashboard-sidebar').onclick = event => {
+      const button = event.target.closest('[data-designer-view]');
+      if (button) this.openDesignerDashboardView(button.dataset.designerView);
+    };
   }
 
   async dashboardView_old() {
@@ -2341,21 +3236,35 @@ class App {
     const isAdmin = this.user.role === 'admin';
     const isPlatform = this.user.role === 'platform';
     const isManager = isAdmin || isPlatform;
+    const isDesigner = this.user.role === 'designer';
     this.show(`<section class="notifications-page ${isManager ? 'admin-notifications-page' : ''} ${isPlatform ? 'platform-notifications-page' : ''}">
-      <div class="notifications-heading"><div><h2>Notifications</h2><p>${isPlatform ? 'Items that need the attention of Platform Management.' : isAdmin ? 'Activity that needs the attention of a User Admin.' : 'Updates about your messages and account.'}</p></div><button class="btn notification-mark-all" id="mark-all-read">${isManager ? 'Mark all as read' : 'Mark messages as read'}</button></div>
+      <div class="notifications-heading"><div><h2>Notifications</h2><p>${isPlatform ? 'Items that need the attention of Platform Management.' : isAdmin ? 'Activity that needs the attention of a User Admin.' : isDesigner ? 'Updates about your projects, clients and appointments.' : 'Updates about your messages and appointments.'}</p></div><button class="btn notification-mark-all" id="mark-all-read">${isManager ? 'Mark all as read' : 'Mark all as read'}</button></div>
       <div class="notification-filters">${isPlatform
         ? '<button class="on" data-filter="all">All</button><button data-filter="unread">Unread</button><button data-filter="verification">Verification</button><button data-filter="feedback">Feedback</button>'
         : isAdmin
         ? '<button class="on" data-filter="all">All</button><button data-filter="unread">Unread</button><button data-filter="designer_signup">Designer sign-ups</button>'
-        : '<button class="on" data-filter="all">All</button><button data-filter="unread">Unread</button><button data-filter="messages">Messages</button>'}</div>
+        : isDesigner
+          ? '<button class="on" data-filter="all">All</button><button data-filter="unread">Unread (0)</button><button data-filter="appointments">Appointments</button><button data-filter="messages">Messages</button>'
+          : '<button class="on" data-filter="all">All</button><button data-filter="unread">Unread</button><button data-filter="messages">Messages</button>'}</div>
       <div id="notifications-list"></div><p id="msg" class="err" role="alert"></p></section>`);
     try {
-      const unread = isManager ? [] : await this.inbox.unreadNotifications();
+      const messages = isManager ? [] : await this.inbox.notificationMessages();
+      const unread = messages.filter(message => !message.read_at);
+      const appointments = isDesigner ? await this.designers.designerAppointments(this.user.id) : [];
+      const milestones = isDesigner ? await this.designers.designerMilestones(this.user.id) : [];
       const adminNotices = isManager ? await this.admin.notifications() : [];
       const list = this.$('#notifications-list');
       let activeFilter = 'all';
       const render = filter => {
-        const messages = isManager || filter === 'designer_signup' ? [] : unread;
+        const visibleMessages = isManager || filter === 'designer_signup' || filter === 'appointments'
+          ? []
+          : messages.filter(message => filter !== 'unread' || !message.read_at);
+        const visibleAppointments = filter === 'messages' || isManager
+          ? []
+          : appointments.filter(appointment => filter !== 'unread' || !appointment.designer_read_at);
+        const visibleMilestones = ['messages', 'appointments'].includes(filter) || isManager
+          ? []
+          : milestones.filter(milestone => filter !== 'unread' || !milestone.read_at);
         const notices = filter === 'messages' ? [] : adminNotices.filter(notice => {
           if (filter === 'verification') return ['designer_signup', 'verification_completed'].includes(notice.kind);
           if (filter === 'feedback') return notice.kind === 'feedback';
@@ -2363,7 +3272,23 @@ class App {
           if (filter === 'unread') return !notice.read_at;
           return true;
         });
-        const messageCards = messages.map(message => `<article class="notification-card is-unread" data-kind="messages"><span class="notification-dot"></span><div><strong>New message</strong><p>${esc(message.sender)} sent you a message${message.conversation?.project?.title ? ` about ${esc(message.conversation.project.title)}` : ''}.</p><button class="btn" data-open-conversation="${message.conversation_id}">Open messages</button></div><time>${new Date(message.created_at).toLocaleString()}</time></article>`).join('');
+        const messageCards = visibleMessages.map(message => `<article class="notification-card ${message.read_at ? 'is-read' : 'is-unread'}" data-kind="messages"><span class="notification-dot" ${message.read_at ? 'hidden' : ''}></span><div><strong>New message</strong><p>${esc(message.sender)} sent you a message${message.conversation?.project?.title ? ` about ${esc(message.conversation.project.title)}` : ''}.</p><button type="button" class="btn" data-open-conversation="${message.conversation_id}">Open messages</button>${!message.read_at ? `<button type="button" class="btn secondary-btn" data-mark-conversation="${message.conversation_id}">Mark as read</button>` : ''}</div><time>${new Date(message.created_at).toLocaleString()}</time></article>`).join('');
+        const appointmentCards = visibleAppointments.map(appointment => {
+          const projectTitle = appointment.project?.title;
+          const title = appointment.status === 'pending' ? 'New appointment request' : `Appointment ${appointment.status}`;
+          return `<article class="notification-card ${appointment.designer_read_at ? 'is-read' : 'is-unread'}" data-kind="appointments">
+            <span class="notification-dot" ${appointment.designer_read_at ? 'hidden' : ''}></span><div><strong>${title}</strong>
+              <p>${esc(appointment.customer?.name || 'A customer')} asked to meet${projectTitle ? ` about “${esc(projectTitle)}”` : ''}.</p>
+              <button type="button" class="btn" data-view-appointment="${appointment.id}">View request</button>
+              ${!appointment.designer_read_at ? `<button type="button" class="btn secondary-btn" data-mark-appointment="${appointment.id}">Mark as read</button>` : ''}
+            </div><time>${new Date(appointment.created_at).toLocaleString()}</time></article>`;
+        }).join('');
+        const milestoneCards = visibleMilestones.map(milestone => `<article class="notification-card ${milestone.read_at ? 'is-read' : 'is-unread'}" data-kind="milestone">
+          <span class="notification-dot" ${milestone.read_at ? 'hidden' : ''}></span><div><strong>Project milestone</strong>
+            <p>${esc(milestone.project?.title || 'Your project')} reached ${milestone.view_count.toLocaleString()} views.</p>
+            <button type="button" class="btn" data-view-insights>See insights</button>
+            ${!milestone.read_at ? `<button type="button" class="btn secondary-btn" data-mark-milestone="${milestone.id}">Mark as read</button>` : ''}
+          </div><time>${new Date(milestone.created_at).toLocaleString()}</time></article>`).join('');
         const noticeCards = notices.map(notice => {
           const designer = notice.kind === 'designer_signup';
           const feedback = notice.kind === 'feedback';
@@ -2385,12 +3310,17 @@ class App {
               ${!notice.read_at ? `<button type="button" class="btn secondary-btn" data-mark-notice="${notice.id}">Mark as read</button>` : ''}
             </div><time>${new Date(notice.created_at).toLocaleString()}</time></article>`;
         }).join('');
-        list.innerHTML = messageCards + noticeCards || '<p class="notification-empty">You’re all caught up.</p>';
+        list.innerHTML = appointmentCards + messageCards + milestoneCards + noticeCards || '<p class="notification-empty">You’re all caught up.</p>';
         const unreadNoticeCount = adminNotices.filter(notice => !notice.read_at).length;
+        const unreadAppointmentCount = appointments.filter(appointment => !appointment.designer_read_at).length;
+        const unreadMilestoneCount = milestones.filter(milestone => !milestone.read_at).length;
         if (isPlatform) {
           this.$('[data-filter="unread"]').textContent = `Unread (${unreadNoticeCount})`;
+        } else if (isDesigner) {
+          this.$('[data-filter="unread"]').textContent = `Unread (${unread.length + unreadAppointmentCount + unreadMilestoneCount})`;
         }
-        this.$('#mark-all-read').hidden = messages.length === 0 && unreadNoticeCount === 0;
+        this.$('#mark-all-read').hidden = unread.length === 0 && unreadAppointmentCount === 0
+          && unreadMilestoneCount === 0 && unreadNoticeCount === 0;
       };
       render('all');
       this.$('.notification-filters').onclick = e => {
@@ -2400,15 +3330,65 @@ class App {
         this.$$('.notification-filters button').forEach(item => item.classList.toggle('on', item === button));
         render(activeFilter);
       };
+      const withReadFeedback = async (button, action) => {
+        const label = button.textContent;
+        button.disabled = true;
+        button.textContent = 'Marking as read…';
+        try {
+          await action();
+        } catch (error) {
+          button.disabled = false;
+          button.textContent = label;
+          throw error;
+        }
+      };
       list.onclick = this.guard(async e => {
         const conversation = e.target.closest('[data-open-conversation]');
         const markNotice = e.target.closest('[data-mark-notice]');
+        const markConversation = e.target.closest('[data-mark-conversation]');
+        const markAppointment = e.target.closest('[data-mark-appointment]');
+        const markMilestone = e.target.closest('[data-mark-milestone]');
+        const viewAppointment = e.target.closest('[data-view-appointment]');
+        const viewInsights = e.target.closest('[data-view-insights]');
         if (conversation) {
           await this.open('messages', Number(conversation.dataset.openConversation));
           return;
         }
+        if (markConversation) {
+          await withReadFeedback(markConversation, () => this.inbox.markRead(Number(markConversation.dataset.markConversation)));
+          messages.forEach(message => {
+            if (message.conversation_id === Number(markConversation.dataset.markConversation)) message.read_at = new Date().toISOString();
+          });
+          render(this.$('.notification-filters button.on')?.dataset.filter ?? 'all');
+          await this.refreshNotificationCount();
+          return;
+        }
+        if (markAppointment) {
+          await withReadFeedback(markAppointment, () => this.designers.markAppointmentRead(Number(markAppointment.dataset.markAppointment), this.user.id));
+          const appointment = appointments.find(item => item.id === Number(markAppointment.dataset.markAppointment));
+          if (appointment) appointment.designer_read_at = new Date().toISOString();
+          render(this.$('.notification-filters button.on')?.dataset.filter ?? 'all');
+          await this.refreshNotificationCount();
+          return;
+        }
+        if (viewAppointment) {
+          this.openDesignerDashboardView('appointments');
+          return;
+        }
+        if (markMilestone) {
+          await withReadFeedback(markMilestone, () => this.designers.markMilestoneRead(Number(markMilestone.dataset.markMilestone), this.user.id));
+          const milestone = milestones.find(item => item.id === Number(markMilestone.dataset.markMilestone));
+          if (milestone) milestone.read_at = new Date().toISOString();
+          render(this.$('.notification-filters button.on')?.dataset.filter ?? 'all');
+          await this.refreshNotificationCount();
+          return;
+        }
+        if (viewInsights) {
+          this.openDesignerDashboardView('insights');
+          return;
+        }
         if (markNotice) {
-          await this.admin.markNotificationRead(Number(markNotice.dataset.markNotice));
+          await withReadFeedback(markNotice, () => this.admin.markNotificationRead(Number(markNotice.dataset.markNotice)));
           const notice = adminNotices.find(item => item.id === Number(markNotice.dataset.markNotice));
           if (notice) notice.read_at = new Date().toISOString();
           render(this.$('.notification-filters button.on')?.dataset.filter ?? 'all');
@@ -2439,7 +3419,16 @@ class App {
           } else {
             const conversationIds = [...new Set(unread.map(message => message.conversation_id))];
             await Promise.all(conversationIds.map(id => this.inbox.markRead(id)));
-            await this.notificationsView();
+            if (isDesigner) {
+              await Promise.all(appointments.filter(item => !item.designer_read_at)
+                .map(item => this.designers.markAppointmentRead(item.id, this.user.id)));
+              await Promise.all(milestones.filter(item => !item.read_at)
+                .map(item => this.designers.markMilestoneRead(item.id, this.user.id)));
+              appointments.forEach(item => { if (!item.designer_read_at) item.designer_read_at = new Date().toISOString(); });
+              milestones.forEach(item => { if (!item.read_at) item.read_at = new Date().toISOString(); });
+              messages.forEach(item => { if (!item.read_at) item.read_at = new Date().toISOString(); });
+              render(activeFilter);
+            } else await this.notificationsView();
             await this.refreshNotificationCount();
           }
         } catch (error) {

@@ -31,7 +31,9 @@ A browser-based interior designer matching app using Supabase for authentication
 The schema creates the app's profiles, companies, projects, categories, comments, notifications, feedback, messaging tables, policies, and triggers. It also sets up account email synchronization. The script seeds example categories; avoid running it repeatedly on a populated database because some initial table and seed statements are not intended as repeatable migrations.
 The schema also creates the public `project-images` Storage bucket used when designers upload project photos.
 
-If the app reports **Bucket not found** while creating a project, open the Supabase SQL Editor for the project configured in `config.js` and run the **Storage bucket used for project photos** section at the bottom of `schema.sql`. This section is safe to run again. Then retry creating the project.
+The designer dashboard adds a repeatable migration block at the bottom of `schema.sql`, starting with **Designer dashboard profile, project workflow and view-history migration**. If the rest of the schema is already installed, run only that block in the Supabase SQL Editor to enable company profiles, project stages/drafts, workflow sharing, view history, 100-view project milestones, and structured appointment requests. New view history and milestone notices start when the migration is applied; they cannot reconstruct events from existing aggregate view counts.
+
+If the app reports **Bucket not found** while creating a project or uploading a company logo/cover, open the Supabase SQL Editor for the project configured in `config.js` and run the **Storage bucket used for project photos** section in `schema.sql`. This section is safe to run again. Then retry the upload.
 
 ### Create the first User Admin
 
@@ -108,12 +110,15 @@ Registration supports customer and interior designer accounts. Designer registra
 
 This is a static site. Deploy `index.html`, `app.js`, and `config.js` together to any static web host that serves ES modules over HTTPS. Configure the deployed site URL and redirect URLs in Supabase Authentication settings.
 
-The daily, weekly, and monthly report pages currently display sample figures rather than database-derived analytics.
+The daily, weekly, and monthly platform report pages currently display sample figures rather than database-derived analytics. Designer interest insights use project view and shortlist totals; dated view charts are collected after the designer dashboard migration is applied.
 
 ## Troubleshooting
 
 - **Could not find a table or column / schema cache error:** confirm `schema.sql` ran against the same Supabase project configured in `config.js`. After schema changes, refresh the Supabase API schema cache if needed.
-- **Bucket not found when creating a project:** run the **Storage bucket used for project photos** section at the bottom of `schema.sql` in the SQL Editor for the Supabase project configured in `config.js`. A selected project image cannot upload until the `project-images` bucket exists.
+- **Bucket not found when uploading a project image or company logo/cover:** run the **Storage bucket used for project photos** section in `schema.sql` in the SQL Editor for the Supabase project configured in `config.js`. Uploads require the `project-images` bucket.
+- **Designer dashboard reports a missing column or table:** run the **Designer dashboard profile, project workflow and view-history migration** block at the bottom of `schema.sql` in the SQL Editor.
+- **Could not find `public.project_milestones` in the schema cache:** run the latest designer dashboard migration block at the bottom of `schema.sql` against the Supabase project configured in `config.js`. The block creates this table and requests a PostgREST schema-cache reload. If the error remains, verify the SQL completed successfully and run `notify pgrst, 'reload schema';` in the SQL Editor, then reload the app.
+- **Appointments reports a missing table or permission error:** run the same designer dashboard migration block in the Supabase project configured in `config.js`. Appointment requests are stored in `public.appointment_requests` and protected by row-level security.
 - **Permission denied / row-level security error:** verify that the relevant policies in `schema.sql` were applied and that the signed-in account has the intended role.
 - **Admin account actions fail:** confirm the `admin-users` function is deployed to the configured project and its `SUPABASE_SERVICE_ROLE_KEY` secret is set.
 - **Email change remains pending:** the user may need to confirm the new address. Profile email is synchronized when Supabase Auth applies the email update.
