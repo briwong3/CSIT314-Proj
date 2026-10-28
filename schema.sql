@@ -20,7 +20,8 @@ alter table public.companies add column if not exists rejection_reason text;
 create table projects(
   id serial primary key, designer_id uuid references profiles on delete cascade,
   title text not null, description text, category_id int references categories,
-  budget numeric, views int default 0, shortlists int default 0, created_at timestamptz default now());
+  budget numeric, image_url text, views int default 0, shortlists int default 0, created_at timestamptz default now());
+alter table public.projects add column if not exists image_url text;
 create table audit_logs(id bigserial primary key, actor uuid, action text, detail text, created_at timestamptz default now());
 create table if not exists notifications(
   id bigserial primary key,
@@ -143,6 +144,24 @@ drop policy if exists companies_platform_update on public.companies;
 create policy companies_platform_update on public.companies for update to authenticated
   using (my_role()='platform') with check (my_role()='platform');
 create policy pr_read on projects for select to authenticated using (true);
+drop policy if exists projects_designer_insert on public.projects;
+create policy projects_designer_insert on public.projects
+  for insert to authenticated
+  with check (
+    designer_id = auth.uid()
+    and exists (
+      select 1 from public.profiles p
+      where p.id = auth.uid() and p.role = 'designer' and p.status = 'active'
+    )
+  );
+drop policy if exists projects_designer_update on public.projects;
+create policy projects_designer_update on public.projects
+  for update to authenticated
+  using (designer_id = auth.uid())
+  with check (designer_id = auth.uid());
+create policy projects_designer_delete on public.projects
+  for delete to authenticated
+  using (designer_id = auth.uid());
 create policy cm_read on comments for select to authenticated using (true);
 create policy cm_add on comments for insert to authenticated with check (user_id=auth.uid() and my_role()='customer');
 create policy prof_read on profiles for select to authenticated using (id=auth.uid() or role='designer' or my_role()='admin');
@@ -353,6 +372,19 @@ grant usage, select on sequence public.conversations_id_seq, public.messages_id_
 -- Notification-page migration for existing databases. Safe to run by itself.
 alter table public.notifications add column if not exists kind text not null default 'platform';
 alter table public.notifications add column if not exists read_at timestamptz;
+grant select, insert, update, delete on public.projects to authenticated;
+-- Storage bucket used for project photos. Create this in Supabase SQL editor or dashboard.
+insert into storage.buckets (id, name, public)
+values ('project-images', 'project-images', true)
+on conflict (id) do update set public = excluded.public;
+drop policy if exists project_images_select on storage.objects;
+drop policy if exists project_images_insert on storage.objects;
+drop policy if exists project_images_update on storage.objects;
+drop policy if exists project_images_delete on storage.objects;
+create policy project_images_select on storage.objects for select to authenticated using (bucket_id = 'project-images');
+create policy project_images_insert on storage.objects for insert to authenticated with check (bucket_id = 'project-images' and auth.role() = 'authenticated');
+create policy project_images_update on storage.objects for update to authenticated using (bucket_id = 'project-images' and owner = auth.uid()) with check (bucket_id = 'project-images' and owner = auth.uid());
+create policy project_images_delete on storage.objects for delete to authenticated using (bucket_id = 'project-images' and owner = auth.uid());
 grant update on public.notifications to authenticated;
 drop policy if exists note_admin_update on public.notifications;
 create policy note_admin_update on public.notifications

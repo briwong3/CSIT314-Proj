@@ -29,6 +29,9 @@ A browser-based interior designer matching app using Supabase for authentication
 3. Confirm the query completes successfully. DDL statements commonly report **Success. No rows returned**; that is expected.
 
 The schema creates the app's profiles, companies, projects, categories, comments, notifications, feedback, messaging tables, policies, and triggers. It also sets up account email synchronization. The script seeds example categories; avoid running it repeatedly on a populated database because some initial table and seed statements are not intended as repeatable migrations.
+The schema also creates the public `project-images` Storage bucket used when designers upload project photos.
+
+If the app reports **Bucket not found** while creating a project, open the Supabase SQL Editor for the project configured in `config.js` and run the **Storage bucket used for project photos** section at the bottom of `schema.sql`. This section is safe to run again. Then retry creating the project.
 
 ### Create the first User Admin
 
@@ -110,6 +113,7 @@ The daily, weekly, and monthly report pages currently display sample figures rat
 ## Troubleshooting
 
 - **Could not find a table or column / schema cache error:** confirm `schema.sql` ran against the same Supabase project configured in `config.js`. After schema changes, refresh the Supabase API schema cache if needed.
+- **Bucket not found when creating a project:** run the **Storage bucket used for project photos** section at the bottom of `schema.sql` in the SQL Editor for the Supabase project configured in `config.js`. A selected project image cannot upload until the `project-images` bucket exists.
 - **Permission denied / row-level security error:** verify that the relevant policies in `schema.sql` were applied and that the signed-in account has the intended role.
 - **Admin account actions fail:** confirm the `admin-users` function is deployed to the configured project and its `SUPABASE_SERVICE_ROLE_KEY` secret is set.
 - **Email change remains pending:** the user may need to confirm the new address. Profile email is synchronized when Supabase Auth applies the email update.

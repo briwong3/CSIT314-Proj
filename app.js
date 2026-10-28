@@ -93,6 +93,29 @@ class DesignerController { // "find a designer": search, filter, sort, details
   updateCategory(id, fields) {
     return db.from('categories').update(fields).eq('id', id).then(must);
   }
+  async createProject(fields, imageFile = null) {
+    let imageUrl = null;
+    if (imageFile) {
+      const safeName = imageFile.name.replace(/[^a-zA-Z0-9._-]/g, '_');
+      const path = `projects/${fields.designer_id}/${Date.now()}-${safeName}`;
+      const { error: uploadError } = await db.storage.from('project-images').upload(path, imageFile, {
+        cacheControl: '3600',
+        upsert: false,
+        contentType: imageFile.type || 'application/octet-stream'
+      });
+      if (uploadError) throw uploadError;
+      imageUrl = db.storage.from('project-images').getPublicUrl(path).data.publicUrl;
+    }
+
+    return must(await db.from('projects').insert({
+      designer_id: fields.designer_id,
+      title: fields.title,
+      description: fields.description || null,
+      category_id: fields.category_id || null,
+      budget: fields.budget === '' || fields.budget == null ? null : Number(fields.budget),
+      image_url: imageUrl
+    }));
+  }
   async designerVerificationQueue() {
     const [profiles, companies] = await Promise.all([
       db.from('profiles').select('id,name,email,created_at').eq('role', 'designer').order('created_at', { ascending: false }),
@@ -768,24 +791,75 @@ class App {
 
   async projectsView() {
     const cats = await this.designers.categories();
+    const createProjectButton = this.user?.role === 'designer'
+      ? `<button class="btn secondary-btn" id="new-project" type="button">Create project</button>`
+      : '';
     this.show(`<section class="project-browser"><h1>Browse projects</h1><p class="finder-intro">Explore interior projects and open one to see its details and comments.</p>
       <div class="finder-filters project-filters"><label>Keyword<input id="q" placeholder="e.g. Scandinavian, kitchen"></label><label>Category<select id="cat"><option value="">All categories</option>${cats.map(c => `<option value="${c.id}">${esc(c.name)}</option>`).join('')}</select></label>
-      <label>Budget<select id="budget"><option value="">Any budget</option><option value="0-10000">Under $10,000</option><option value="10000-30000">$10,000–$30,000</option><option value="30000-50000">$30,000–$50,000</option><option value="50000+">$50,000+</option></select></label><button class="btn" id="go">Search</button></div>
-      <p class="results-count" id="count"></p><div id="res" class="project-browser-grid"></div><p id="msg" class="err" role="alert"></p></section>`);
+      <label>Budget<select id="budget"><option value="">Any budget</option><option value="0-10000">Under $10,000</option><option value="10000-30000">$10,000–$30,000</option><option value="30000-50000">$30,000–$50,000</option><option value="50000+">$50,000+</option></select></label><button class="btn" id="go">Search</button>${createProjectButton}</div>
+      <p class="results-count" id="count"></p><div id="res" class="project-browser-grid"></div><p id="msg" class="err" role="alert"></p></section>
+      <dialog class="account-edit-dialog project-dialog" id="project-dialog" aria-labelledby="project-dialog-title">
+        <form id="project-form">
+          <div class="account-edit-heading"><h2 id="project-dialog-title">Create a project</h2><button type="button" class="account-modal-close" id="close-project-dialog" aria-label="Close dialog">×</button></div>
+          <label>Project title<input name="title" maxlength="120" required></label>
+          <label>Category<select name="category_id"><option value="">Select a category</option>${cats.map(c => `<option value="${c.id}">${esc(c.name)}</option>`).join('')}</select></label>
+          <label>Budget (optional)<input name="budget" type="number" min="0" step="100" placeholder="e.g. 12000"></label>
+          <label>Project image (optional)<input name="image" type="file" accept="image/*"></label>
+          <label>Description<textarea name="description" rows="5" maxlength="2000" placeholder="Describe the design style, room type and key details."></textarea></label>
+          <p class="err project-dialog-error" role="alert"></p>
+          <div class="account-edit-actions"><button type="button" class="btn secondary-btn" id="cancel-project-dialog">Cancel</button><button type="submit" class="btn">Save project</button></div>
+        </form>
+      </dialog>`);
+    const dialog = this.$('#project-dialog');
+    const form = this.$('#project-form');
+    const openDialog = () => {
+      form.reset();
+      this.$('.project-dialog-error').textContent = '';
+      dialog.showModal();
+      form.elements.namedItem('title').focus();
+    };
     const run = this.guard(async () => {
       const budget = this.$('#budget').value;
       const [min, max] = budget.endsWith('+') ? [budget.slice(0, -1), ''] : budget ? budget.split('-') : ['', ''];
       const rows = await this.designers.search({ q: this.$('#q').value, cat: this.$('#cat').value, min, max, sort: 'popular' });
       this.$('#count').textContent = `${rows.length} ${rows.length === 1 ? 'project' : 'projects'} found`;
-      this.$('#res').innerHTML = rows.map((project, index) => `<article class="browse-project-card">
-        <button type="button" class="browse-project-cover cover-${index % 4}" data-p="${project.id}" aria-label="View ${esc(project.title)} details"><span>Project photo</span></button>
+      this.$('#res').innerHTML = rows.map((project, index) => {
+        const cover = project.image_url
+          ? `<button type="button" class="browse-project-cover" data-p="${project.id}" aria-label="View ${esc(project.title)} details" style="background-image:url('${project.image_url}'); background-size:cover; background-position:center;"><span>Project photo</span></button>`
+          : `<button type="button" class="browse-project-cover cover-${index % 4}" data-p="${project.id}" aria-label="View ${esc(project.title)} details"><span>Project photo</span></button>`;
+        return `<article class="browse-project-card">${cover}
         <div class="browse-project-info"><p class="project-tag">${esc(project.categories?.name ?? 'Interior design')}</p><h2><a href="#" data-p="${project.id}">${esc(project.title)}</a></h2>
           <p class="browse-project-designer">by <a href="#" data-d="${project.profiles?.id}">${esc(project.profiles?.name ?? 'Designer')}</a></p>
           <div class="browse-project-meta"><span>${Number(project.views ?? 0).toLocaleString()} views</span><span>${project.budget == null ? 'Budget on request' : `$${Number(project.budget).toLocaleString()}`}</span></div>
-        </div></article>`).join('') || `<div class="project-empty-state"><h2>No projects match your search</h2><p>${this.$('#q').value || this.$('#cat').value || budget ? 'Try removing a filter or searching a different keyword.' : 'There are no projects to display yet.'}</p>${this.$('#q').value || this.$('#cat').value || budget ? '<button class="btn" type="button" id="clear-project-filters">Clear filters</button>' : ''}</div>`;
+        </div></article>`;
+      }).join('') || `<div class="project-empty-state"><h2>No projects match your search</h2><p>${this.$('#q').value || this.$('#cat').value || budget ? 'Try removing a filter or searching a different keyword.' : 'There are no projects to display yet.'}</p>${this.$('#q').value || this.$('#cat').value || budget ? '<button class="btn" type="button" id="clear-project-filters">Clear filters</button>' : ''}</div>`;
     });
     this.$('#go').onclick = run;
     this.$('#q').onkeydown = e => { if (e.key === 'Enter') run(e); };
+    this.$('#new-project')?.addEventListener('click', openDialog);
+    this.$('#close-project-dialog')?.addEventListener('click', () => dialog.close());
+    this.$('#cancel-project-dialog')?.addEventListener('click', () => dialog.close());
+    dialog?.addEventListener('click', e => { if (e.target === dialog) dialog.close(); });
+    form?.addEventListener('submit', this.guard(async e => {
+      e.preventDefault();
+      const data = Object.fromEntries(new FormData(form));
+      const title = String(data.title ?? '').trim();
+      const description = String(data.description ?? '').trim();
+      const categoryId = data.category_id ? Number(data.category_id) : null;
+      const budget = data.budget === '' ? null : Number(data.budget);
+      const imageFile = form.elements.namedItem('image').files?.[0] ?? null;
+      if (!title) throw new Error('Project title is required.');
+      if (budget !== null && Number.isNaN(budget)) throw new Error('Budget must be a valid number.');
+      await this.designers.createProject({
+        designer_id: this.user.id,
+        title,
+        description,
+        category_id: categoryId,
+        budget
+      }, imageFile);
+      dialog.close();
+      await this.projectsView();
+    }));
     this.$('#res').onclick = e => {
       if (e.target.closest('#clear-project-filters')) {
         this.$('#q').value = '';
@@ -833,9 +907,12 @@ class App {
     const { p, comments, company } = await this.designers.project(id);
     const designerName = p.profiles?.name ?? 'Interior designer';
     const companyName = company?.name ?? designerName;
+    const projectCover = p.image_url
+      ? `<div class="project-main-photo" style="background-image:url('${p.image_url}'); background-size:cover; background-position:center;"><span>Project photo</span></div>`
+      : `<div class="project-main-photo"><span>Main photo placeholder</span></div>`;
     this.show(`<section class="project-detail">
       <nav class="project-breadcrumb" aria-label="Breadcrumb"><a href="#" id="back">Browse projects</a><span aria-hidden="true">/</span><a href="#" id="project-category">${esc(p.categories?.name ?? 'Interior design')}</a><span aria-hidden="true">/</span><span>${esc(p.title)}</span></nav>
-      <div class="project-detail-layout"><div class="project-gallery"><div class="project-main-photo"><span>Main photo placeholder</span></div>
+      <div class="project-detail-layout"><div class="project-gallery">${projectCover}
         <div class="project-photo-thumbnails"><div class="cover-1"><span>Photo 2</span></div><div class="cover-2"><span>Photo 3</span></div><div class="cover-3"><span>Photo 4</span></div></div></div>
         <aside class="project-summary"><p class="project-tag">${esc(p.categories?.name ?? 'Interior design')}</p><h1>${esc(p.title)}</h1>
           <p class="project-byline">by <a href="#" id="d">${esc(companyName)}</a></p>
