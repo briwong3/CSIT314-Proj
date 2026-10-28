@@ -265,6 +265,20 @@ class DesignerController { // "find a designer": search, filter, sort, details
     const projects = must(await db.from('projects').select('*, categories(name)').eq('designer_id', id).order('created_at', { ascending: false }));
     return { profile, company, projects };
   }
+  async previewDesigner() {
+    const [profiles, projects] = await Promise.all([
+      db.from('profiles').select('id,name').eq('role', 'designer').eq('status', 'active')
+        .order('created_at', { ascending: true }),
+      db.from('projects').select('designer_id')
+    ]);
+    const designers = must(profiles);
+    if (!designers.length) return null;
+    const projectCounts = new Map();
+    must(projects).forEach(project => projectCounts.set(project.designer_id, (projectCounts.get(project.designer_id) ?? 0) + 1));
+    return designers.sort((left, right) =>
+      (projectCounts.get(right.id) ?? 0) - (projectCounts.get(left.id) ?? 0)
+    )[0];
+  }
   addComment(project_id, body) { return db.from('comments').insert({ project_id, body }).then(must); }
 }
 class AdminController {
@@ -422,11 +436,12 @@ class InboxController {
 class App {
   auth = new AuthController(); account = new AccountController();
   designers = new DesignerController(); feedback = new FeedbackController(); admin = new AdminController(); inbox = new InboxController();
-  user = null; tab = null; activeConversation = null; viewAs = null;
+  user = null; tab = null; activeConversation = null; viewAs = null; previewDesignerId = null;
   $ = s => document.querySelector(s);
   $$ = s => document.querySelectorAll(s);
   labels = { dashboard: 'Dashboard', categories: 'IDP categories', accounts: 'Accounts', profiles: 'User profiles', projects: 'Browse projects', designers: 'Find a designer', favorites: 'Favourites', messages: 'Direct messages', account: 'My account', users: 'Users', logs: 'Audit log', notifications: 'Notifications' };
   get isReadOnlyPreview() { return this.user?.role === 'admin' && this.viewAs !== null; }
+  get designerDashboardUserId() { return this.viewAs === 'designer' ? this.previewDesignerId : this.user.id; }
   get canUseDirectMessages() { return ['customer', 'designer'].includes(this.user?.role) && !this.isReadOnlyPreview; }
 
   async start() {
@@ -439,7 +454,7 @@ class App {
   shell() {
     this.inbox.user = this.user;
     const tabs = this.isReadOnlyPreview
-      ? ['projects', 'designers', 'favorites']
+      ? this.viewAs === 'designer' ? ['dashboard'] : ['projects', 'designers', 'favorites']
       : this.user?.role === 'admin'
       ? Permissions.tabs('admin')
       : this.user?.role === 'platform'
@@ -462,7 +477,7 @@ class App {
     this.$('header').classList.remove('auth-header');
     this.$('header').classList.toggle('landing-header', !this.user);
     this.$('header').classList.toggle('signed-in-header', Boolean(this.user));
-    this.$('header').classList.toggle('designer-signed-in-header', this.user?.role === 'designer');
+    this.$('header').classList.toggle('designer-signed-in-header', this.user?.role === 'designer' || this.viewAs === 'designer');
     this.$('header').hidden = false;
     this.$('#nav').innerHTML = this.user?.role === 'platform'
       ? ''
@@ -478,7 +493,7 @@ class App {
     const previewBanner = this.$('#preview-banner');
     previewBanner.hidden = !this.isReadOnlyPreview;
     previewBanner.innerHTML = this.isReadOnlyPreview
-      ? `<div><strong>Previewing as ${this.viewAs === 'customer' ? 'Customer' : 'Interior Designer'}.</strong> Read-only: you are still signed in as ${esc(this.user.name)} (User Admin). Posting, booking and messaging are switched off.</div><button type="button" class="btn" id="back-to-admin">Back to admin view</button>`
+      ? `<div><strong>Previewing as ${this.viewAs === 'customer' ? 'Customer' : 'Interior Designer'}.</strong> Read-only: you are still signed in as ${esc(this.user.name)} (User Admin).${this.viewAs === 'designer' ? ' All designer changes are switched off.' : ' Posting, booking and messaging are switched off.'}</div><button type="button" class="btn" id="back-to-admin">Back to admin view</button>`
       : '';
     if (this.user) {
       this.$('#out').onclick = async () => { await this.auth.logout(); this.user = null; this.viewAs = null; this.start(); };
@@ -486,12 +501,24 @@ class App {
       this.$('#notification-bell').onclick = () => this.toggleNotifications();
       this.refreshNotificationCount();
       const viewAsSelect = this.$('#view-as');
-      if (viewAsSelect) viewAsSelect.onchange = () => {
+      if (viewAsSelect) viewAsSelect.onchange = async () => {
         this.viewAs = ['customer', 'designer'].includes(viewAsSelect.value) ? viewAsSelect.value : null;
-        this.open(this.viewAs === 'customer' ? 'designers' : this.viewAs === 'designer' ? 'projects' : 'dashboard');
+        try {
+          this.previewDesignerId = this.viewAs === 'designer'
+            ? (await this.designers.previewDesigner())?.id ?? null
+            : null;
+          await this.open(this.viewAs === 'customer' ? 'designers' : 'dashboard');
+        } catch (error) {
+          this.viewAs = null;
+          this.previewDesignerId = null;
+          viewAsSelect.value = 'admin';
+          this.open('dashboard');
+          window.alert(`Could not open the designer preview: ${error.message}`);
+        }
       };
       this.$('#back-to-admin')?.addEventListener('click', () => {
         this.viewAs = null;
+        this.previewDesignerId = null;
         this.open('dashboard');
       });
     }
@@ -506,7 +533,7 @@ class App {
     this.homeView();
   }
   async open(t, ...args) {
-    if (this.isReadOnlyPreview && !['projects', 'designers'].includes(t)) return;
+    if (this.isReadOnlyPreview && (this.viewAs === 'designer' ? t !== 'dashboard' : !['projects', 'designers'].includes(t))) return;
     if (t === 'messages' && !this.canUseDirectMessages) return;
     if (['categories', 'verification', 'feedback', 'dailyReport', 'weeklyReport', 'monthlyReport'].includes(t) && this.user?.role !== 'platform') return;
     this.tab = t;
@@ -1826,7 +1853,7 @@ class App {
 
   async dashboardView() {
     if (this.user?.role === 'admin' && !this.isReadOnlyPreview) return this.dashboardView_old();
-    if (this.user?.role === 'designer') {
+    if (this.user?.role === 'designer' || this.viewAs === 'designer') {
       try {
         return await this.designerDashboardView();
       } catch (error) {
@@ -1941,8 +1968,10 @@ class App {
   }
 
   async designerDashboardView() {
+    const designerId = this.designerDashboardUserId;
+    if (!designerId) throw new Error('No active interior designer is available to preview.');
     const [{ projects }, categories] = await Promise.all([
-      this.designers.designer(this.user.id),
+      this.designers.designer(designerId),
       this.designers.categories()
     ]);
     let activeFilter = 'all';
@@ -1959,7 +1988,7 @@ class App {
       <div class="idp-main designer-dashboard-main">
         <div class="designer-dashboard-heading">
           <h1>My portfolio</h1>
-          <button type="button" class="btn designer-add-project" id="designer-add-project">+ Add project</button>
+          <button type="button" class="btn designer-add-project" id="designer-add-project" ${this.isReadOnlyPreview ? 'disabled title="Project creation is disabled in preview mode"' : ''}>+ Add project</button>
         </div>
         <div class="designer-dashboard-metrics">
           <article><span>Total views</span><strong>${totalViews.toLocaleString()}</strong></article>
@@ -2035,7 +2064,7 @@ class App {
           <td><span class="designer-project-visibility ${project.visibility === 'draft' ? 'draft' : ''}">${project.visibility === 'draft' ? 'Draft' : 'Published'}</span></td>
           <td>${Number(project.views ?? 0).toLocaleString()}</td>
           <td>${Number(project.shortlists ?? 0).toLocaleString()}</td>
-          <td><div class="designer-project-actions"><button type="button" class="designer-project-action" data-project-edit="${project.id}">Edit</button><button type="button" class="designer-project-action" data-project-delete="${project.id}">Delete</button></div></td>
+          <td><div class="designer-project-actions"><button type="button" class="designer-project-action" data-project-edit="${project.id}" ${this.isReadOnlyPreview ? 'disabled title="Editing is disabled in preview mode"' : ''}>Edit</button><button type="button" class="designer-project-action" data-project-delete="${project.id}" ${this.isReadOnlyPreview ? 'disabled title="Deleting is disabled in preview mode"' : ''}>Delete</button></div></td>
         </tr>`).join('');
       this.$('#designer-project-empty').hidden = visibleProjects.length > 0;
       this.$('#designer-project-empty').textContent = projects.length
@@ -2063,7 +2092,7 @@ class App {
     };
     const rowById = id => projects.find(project => String(project.id) === String(id));
 
-    this.$('#designer-add-project').onclick = () => showDialog(null);
+    this.$('#designer-add-project').onclick = () => { if (!this.isReadOnlyPreview) showDialog(null); };
     this.$('#designer-project-close').onclick = closeDialog;
     this.$('#designer-project-cancel').onclick = closeDialog;
     dialog.addEventListener('click', event => { if (event.target === dialog) closeDialog(); });
@@ -2076,10 +2105,11 @@ class App {
     this.$('#designer-delete-cancel').onclick = closeDeleteDialog;
     deleteDialog.addEventListener('click', event => { if (event.target === deleteDialog) closeDeleteDialog(); });
     this.$('#designer-unpublish-project').onclick = async () => {
+      if (this.isReadOnlyPreview) return;
       projectPendingDelete = this._pendingDesignerProjectDelete;
       if (!projectPendingDelete) return;
       try {
-        await this.designers.updateProject(projectPendingDelete.id, this.user.id, { visibility: 'draft' });
+        await this.designers.updateProject(projectPendingDelete.id, designerId, { visibility: 'draft' });
         closeDeleteDialog();
         this._pendingDesignerProjectDelete = null;
         await this.designerDashboardView();
@@ -2088,10 +2118,11 @@ class App {
       }
     };
     this.$('#designer-confirm-delete').onclick = async () => {
+      if (this.isReadOnlyPreview) return;
       projectPendingDelete = this._pendingDesignerProjectDelete;
       if (!projectPendingDelete) return;
       try {
-        const cleanupWarning = await this.designers.deleteProject(projectPendingDelete.id, this.user.id);
+        const cleanupWarning = await this.designers.deleteProject(projectPendingDelete.id, designerId);
         closeDeleteDialog();
         this._pendingDesignerProjectDelete = null;
         await this.designerDashboardView();
@@ -2102,6 +2133,7 @@ class App {
     };
     form.onsubmit = async event => {
       event.preventDefault();
+      if (this.isReadOnlyPreview) return;
       const data = Object.fromEntries(new FormData(form));
       const title = String(data.title ?? '').trim();
       const budget = data.budget === '' ? null : Number(data.budget);
@@ -2128,11 +2160,11 @@ class App {
       };
       try {
         if (form.dataset.projectId) {
-          await this.designers.updateProject(form.dataset.projectId, this.user.id, fields);
+          await this.designers.updateProject(form.dataset.projectId, designerId, fields);
         } else {
           await this.designers.createProject({
             ...fields,
-            designer_id: this.user.id
+            designer_id: designerId
           }, form.elements.namedItem('image').files?.[0] ?? null);
         }
         closeDialog();
@@ -2157,9 +2189,11 @@ class App {
       const editButton = event.target.closest('[data-project-edit]');
       const deleteButton = event.target.closest('[data-project-delete]');
       if (editButton) {
+        if (this.isReadOnlyPreview) return;
         const project = rowById(editButton.dataset.projectEdit);
         if (project) showDialog(project);
       } else if (deleteButton) {
+        if (this.isReadOnlyPreview) return;
         const project = rowById(deleteButton.dataset.projectDelete);
         if (project) this.showProjectDeleteDialog(project);
       }
@@ -2185,7 +2219,9 @@ class App {
   }
 
   async companyInformationView() {
-    const { profile, company } = await this.designers.designer(this.user.id);
+    const designerId = this.designerDashboardUserId;
+    if (!designerId) throw new Error('No active interior designer is available to preview.');
+    const { profile, company } = await this.designers.designer(designerId);
     const categories = await this.designers.categories();
     const specialties = Array.isArray(company?.specialties) ? company.specialties : [];
     const designAreas = Array.isArray(company?.design_areas) ? company.design_areas : [];
@@ -2231,7 +2267,7 @@ class App {
         <section class="designer-form-card">
           <h2>Contact details</h2>
           <div class="designer-form-grid">
-            <label>Email<input name="email" type="email" maxlength="254" value="${esc(company?.email ?? this.user.email ?? '')}"></label>
+            <label>Email<input name="email" type="email" maxlength="254" value="${esc(company?.email ?? (this.isReadOnlyPreview ? '' : this.user.email ?? ''))}"></label>
             <label>Phone<input name="phone" type="tel" maxlength="40" value="${esc(company?.phone ?? '')}"></label>
             <label>Website<input name="website" type="url" maxlength="300" value="${esc(company?.website ?? '')}" placeholder="https://"></label>
             <label>Address<input name="address" maxlength="300" value="${esc(company?.address ?? '')}"></label>
@@ -2298,19 +2334,26 @@ class App {
       image.src = URL.createObjectURL(file);
       coverLabel.prepend(image);
     };
+    if (this.isReadOnlyPreview) {
+      form.querySelectorAll('input,textarea,button[type="submit"],.designer-upload-input').forEach(control => {
+        control.disabled = true;
+      });
+      this.$('#discard-company-changes').disabled = true;
+    }
     this.$('#company-preview-toggle').onclick = () => {
-      const values = new FormData(form);
-      const checked = name => values.getAll(name).map(value => String(value));
-      preview.innerHTML = `<h2>${esc(values.get('name') || 'Company name')}</h2>
-        <p>${esc(values.get('tagline') || '')}</p>
-        <p>${esc(values.get('bio') || 'Add a company description to preview it here.')}</p>
+      const field = name => form.elements.namedItem(name)?.value ?? '';
+      const checked = name => [...form.querySelectorAll(`[name="${name}"]:checked`)].map(input => input.value);
+      preview.innerHTML = `<h2>${esc(field('name') || 'Company name')}</h2>
+        <p>${esc(field('tagline'))}</p>
+        <p>${esc(field('bio') || 'Add a company description to preview it here.')}</p>
         <p><strong>Specialties:</strong> ${esc(checked('specialties').join(', ') || 'None selected')}</p>
-        <p><strong>Services:</strong> ${esc(String(values.get('services') || '').split('\n').filter(Boolean).join(' · ') || 'None listed')}</p>
+        <p><strong>Services:</strong> ${esc(String(field('services')).split('\n').filter(Boolean).join(' · ') || 'None listed')}</p>
         <p><strong>Areas:</strong> ${esc(checked('design_areas').join(', ') || 'None selected')}</p>`;
       switchCompanyTab(true);
     };
     form.onsubmit = async event => {
       event.preventDefault();
+      if (this.isReadOnlyPreview) return;
       const values = new FormData(form);
       const year = String(values.get('year_established') ?? '').trim();
       const yearEstablished = year ? Number(year) : null;
@@ -2323,10 +2366,10 @@ class App {
       this.$('.designer-company-error').textContent = '';
       try {
         const [logoUrl, coverUrl] = await Promise.all([
-          this.designers.uploadCompanyAsset(this.user.id, 'logo', form.elements.namedItem('logo').files[0]),
-          this.designers.uploadCompanyAsset(this.user.id, 'cover', form.elements.namedItem('cover').files[0])
+          this.designers.uploadCompanyAsset(designerId, 'logo', form.elements.namedItem('logo').files[0]),
+          this.designers.uploadCompanyAsset(designerId, 'cover', form.elements.namedItem('cover').files[0])
         ]);
-        await this.designers.saveCompany(this.user.id, {
+        await this.designers.saveCompany(designerId, {
           name: String(values.get('name')).trim(),
           tagline: String(values.get('tagline') ?? '').trim() || null,
           year_established: yearEstablished,
@@ -2351,9 +2394,11 @@ class App {
   }
 
   async interestInsightsView() {
+    const designerId = this.designerDashboardUserId;
+    if (!designerId) throw new Error('No active interior designer is available to preview.');
     const [{ projects }, activity] = await Promise.all([
-      this.designers.designer(this.user.id),
-      this.designers.designerActivity(this.user.id)
+      this.designers.designer(designerId),
+      this.designers.designerActivity(designerId)
     ]);
     const publishedProjects = projects.filter(project => project.visibility !== 'draft');
     const categories = await this.designers.categories();
@@ -2436,7 +2481,9 @@ class App {
   }
 
   async processWorkflowView() {
-    const { company } = await this.designers.designer(this.user.id);
+    const designerId = this.designerDashboardUserId;
+    if (!designerId) throw new Error('No active interior designer is available to preview.');
+    const { company } = await this.designers.designer(designerId);
     const templates = {
       standard: [
         ['Initial consultation', '1 week', true, 'Meet the client, listen to their needs and agree the scope.'],
@@ -2456,12 +2503,12 @@ class App {
       : templates.standard.map(([title, duration, approval, description]) => ({ title, duration, approval, description }));
     this.showDesignerPage(`
       <div class="designer-page-heading"><div><h1>Process workflow</h1><p>Show clients how you work, step by step, so you and your clients stay aligned.</p></div>
-        <div class="designer-workflow-actions"><button type="button" class="designer-outline-button" id="workflow-preview">Preview as client</button><button type="submit" form="designer-workflow-form" class="btn designer-add-project">Save changes</button></div>
+        <div class="designer-workflow-actions"><button type="button" class="designer-outline-button" id="workflow-preview">Preview as client</button><button type="submit" form="designer-workflow-form" class="btn designer-add-project" ${this.isReadOnlyPreview ? 'disabled' : ''}>Save changes</button></div>
       </div>
       <form id="designer-workflow-form" class="designer-workflow-form">
-        <div class="designer-workflow-toolbar"><label>Start from a template<select id="workflow-template"><option value="">Choose a template</option><option value="standard">Interior design project</option><option value="compact">Short project</option></select></label><button type="button" class="designer-outline-button" id="workflow-add-step">+ Add step</button></div>
+        <div class="designer-workflow-toolbar"><label>Start from a template<select id="workflow-template" ${this.isReadOnlyPreview ? 'disabled' : ''}><option value="">Choose a template</option><option value="standard">Interior design project</option><option value="compact">Short project</option></select></label><button type="button" class="designer-outline-button" id="workflow-add-step" ${this.isReadOnlyPreview ? 'disabled' : ''}>+ Add step</button></div>
         <div class="designer-workflow-steps" id="workflow-steps"></div>
-        <section class="designer-form-card designer-workflow-sharing"><h2>Share with clients</h2><label class="designer-check"><input type="checkbox" name="workflow_public" ${company?.workflow_public ? 'checked' : ''}><span>Show this process on my public company profile</span></label>
+        <section class="designer-form-card designer-workflow-sharing"><h2>Share with clients</h2><label class="designer-check"><input type="checkbox" name="workflow_public" ${company?.workflow_public ? 'checked' : ''} ${this.isReadOnlyPreview ? 'disabled' : ''}><span>Show this process on my public company profile</span></label>
           <p class="muted">Your workflow will appear on your public company profile when enabled.</p></section>
         <p class="err designer-workflow-error" role="alert"></p><p class="designer-workflow-success" role="status"></p>
       </form>
@@ -2471,12 +2518,12 @@ class App {
     const renderSteps = () => {
       list.innerHTML = steps.map((step, index) => `
         <article class="designer-workflow-step" data-step-index="${index}">
-          <div class="designer-workflow-step-heading"><span class="designer-workflow-number">${index + 1}</span><strong>Step ${index + 1}</strong><button type="button" class="designer-outline-button" data-move-step="${index}" data-direction="-1" aria-label="Move step up" ${index === 0 ? 'disabled' : ''}>↑</button><button type="button" class="designer-outline-button" data-move-step="${index}" data-direction="1" aria-label="Move step down" ${index === steps.length - 1 ? 'disabled' : ''}>↓</button><button type="button" class="designer-outline-button" data-remove-step="${index}">Remove</button></div>
+          <div class="designer-workflow-step-heading"><span class="designer-workflow-number">${index + 1}</span><strong>Step ${index + 1}</strong><button type="button" class="designer-outline-button" data-move-step="${index}" data-direction="-1" aria-label="Move step up" ${index === 0 || this.isReadOnlyPreview ? 'disabled' : ''}>↑</button><button type="button" class="designer-outline-button" data-move-step="${index}" data-direction="1" aria-label="Move step down" ${index === steps.length - 1 || this.isReadOnlyPreview ? 'disabled' : ''}>↓</button><button type="button" class="designer-outline-button" data-remove-step="${index}" ${this.isReadOnlyPreview ? 'disabled' : ''}>Remove</button></div>
           <div class="designer-workflow-fields">
-            <label>Step title<input name="title" maxlength="100" value="${esc(step.title)}" required></label>
-            <label>Typical duration<input name="duration" maxlength="60" value="${esc(step.duration)}" placeholder="e.g. 1–2 weeks"></label>
-            <label class="designer-check"><input name="approval" type="checkbox" ${step.approval ? 'checked' : ''}><span>Needs client approval</span></label>
-            <label class="designer-workflow-description">What happens in this step<textarea name="description" rows="2" maxlength="1000" placeholder="Describe this step">${esc(step.description)}</textarea></label>
+            <label>Step title<input name="title" maxlength="100" value="${esc(step.title)}" required ${this.isReadOnlyPreview ? 'disabled' : ''}></label>
+            <label>Typical duration<input name="duration" maxlength="60" value="${esc(step.duration)}" placeholder="e.g. 1–2 weeks" ${this.isReadOnlyPreview ? 'disabled' : ''}></label>
+            <label class="designer-check"><input name="approval" type="checkbox" ${step.approval ? 'checked' : ''} ${this.isReadOnlyPreview ? 'disabled' : ''}><span>Needs client approval</span></label>
+            <label class="designer-workflow-description">What happens in this step<textarea name="description" rows="2" maxlength="1000" placeholder="Describe this step" ${this.isReadOnlyPreview ? 'disabled' : ''}>${esc(step.description)}</textarea></label>
           </div>
         </article>`).join('');
     };
@@ -2490,6 +2537,7 @@ class App {
       }));
     };
     list.onclick = event => {
+      if (this.isReadOnlyPreview) return;
       const remove = event.target.closest('[data-remove-step]');
       const move = event.target.closest('[data-move-step]');
       if (remove) {
@@ -2502,11 +2550,13 @@ class App {
       renderSteps();
     };
     this.$('#workflow-add-step').onclick = () => {
+      if (this.isReadOnlyPreview) return;
       steps.push({ title: '', duration: '', approval: false, description: '' });
       renderSteps();
       list.lastElementChild.querySelector('[name="title"]').focus();
     };
     this.$('#workflow-template').onchange = event => {
+      if (this.isReadOnlyPreview) return;
       if (templates[event.target.value]) {
         steps = templates[event.target.value].map(([title, duration, approval, description]) => ({ title, duration, approval, description }));
         renderSteps();
@@ -2527,6 +2577,7 @@ class App {
     };
     this.$('#designer-workflow-form').onsubmit = async event => {
       event.preventDefault();
+      if (this.isReadOnlyPreview) return;
       updateSteps();
       if (!steps.length || steps.some(step => !step.title)) {
         this.$('.designer-workflow-error').textContent = 'Add at least one step and give each step a title.';
@@ -2536,7 +2587,7 @@ class App {
       button.disabled = true;
       this.$('.designer-workflow-error').textContent = '';
       try {
-        await this.designers.saveCompany(this.user.id, {
+        await this.designers.saveCompany(designerId, {
           workflow_steps: steps,
           workflow_public: this.$('#designer-workflow-form [name="workflow_public"]').checked
         });
@@ -2550,7 +2601,9 @@ class App {
   }
 
   async designerAppointmentsView() {
-    const records = await this.designers.designerAppointments(this.user.id);
+    const designerId = this.designerDashboardUserId;
+    if (!designerId) throw new Error('No active interior designer is available to preview.');
+    const records = await this.designers.designerAppointments(designerId);
     const pending = records.filter(record => record.status === 'pending');
     const upcoming = records.filter(record => ['accepted', 'proposed'].includes(record.status));
     const history = records.filter(record => ['declined', 'cancelled'].includes(record.status));
@@ -2567,11 +2620,11 @@ class App {
         ${record.response_message ? `<p class="designer-appointment-response">${esc(record.response_message)}</p>` : ''}
       </div>
       <div class="designer-appointment-actions">
-        ${section === 'pending' ? `<button type="button" class="btn" data-appointment-action="accept" data-appointment-id="${record.id}">Accept</button>
-          <button type="button" class="designer-outline-button" data-appointment-action="propose" data-appointment-id="${record.id}">Suggest another time</button>
-          <button type="button" class="designer-outline-button" data-appointment-action="decline" data-appointment-id="${record.id}">Decline</button>` : ''}
-        ${section === 'upcoming' ? `${record.status === 'accepted' ? `<button type="button" class="designer-outline-button" data-appointment-action="reschedule" data-appointment-id="${record.id}">Reschedule</button>` : ''}
-          <button type="button" class="designer-outline-button" data-appointment-action="cancel" data-appointment-id="${record.id}">Cancel</button>` : ''}
+        ${section === 'pending' ? `<button type="button" class="btn" data-appointment-action="accept" data-appointment-id="${record.id}" ${this.isReadOnlyPreview ? 'disabled' : ''}>Accept</button>
+          <button type="button" class="designer-outline-button" data-appointment-action="propose" data-appointment-id="${record.id}" ${this.isReadOnlyPreview ? 'disabled' : ''}>Suggest another time</button>
+          <button type="button" class="designer-outline-button" data-appointment-action="decline" data-appointment-id="${record.id}" ${this.isReadOnlyPreview ? 'disabled' : ''}>Decline</button>` : ''}
+        ${section === 'upcoming' ? `${record.status === 'accepted' ? `<button type="button" class="designer-outline-button" data-appointment-action="reschedule" data-appointment-id="${record.id}" ${this.isReadOnlyPreview ? 'disabled' : ''}>Reschedule</button>` : ''}
+          <button type="button" class="designer-outline-button" data-appointment-action="cancel" data-appointment-id="${record.id}" ${this.isReadOnlyPreview ? 'disabled' : ''}>Cancel</button>` : ''}
       </div>
     </article>`;
     this.showDesignerPage(`<div class="designer-page-heading"><div><h1>Appointments</h1><p>Review appointment requests and manage your upcoming meetings.</p></div></div>
@@ -2609,6 +2662,7 @@ class App {
       dialog.showModal();
     };
     page.onclick = async event => {
+      if (this.isReadOnlyPreview) return;
       const button = event.target.closest('[data-appointment-action]');
       if (!button) return;
       const record = records.find(item => String(item.id) === button.dataset.appointmentId);
@@ -2624,7 +2678,7 @@ class App {
         const fields = action === 'accept' ? { status: 'accepted', response_message: null }
           : action === 'decline' ? { status: 'declined' }
             : { status: 'cancelled' };
-        await this.designers.updateAppointment(record.id, this.user.id, fields);
+        await this.designers.updateAppointment(record.id, designerId, fields);
         await this.designerAppointmentsView();
       } catch (error) {
         button.disabled = false;
@@ -2634,6 +2688,7 @@ class App {
     this.$('#appointment-action-cancel').onclick = () => dialog.close();
     this.$('#appointment-action-form').onsubmit = async event => {
       event.preventDefault();
+      if (this.isReadOnlyPreview) return;
       const submit = this.$('#appointment-action-submit');
       submit.disabled = true;
       this.$('#appointment-action-error').textContent = '';
@@ -2644,7 +2699,7 @@ class App {
         if (Number.isNaN(scheduled.getTime()) || scheduled <= new Date()) {
           throw new Error('Choose a future date and time.');
         }
-        await this.designers.updateAppointment(activeRecord.id, this.user.id, {
+        await this.designers.updateAppointment(activeRecord.id, designerId, {
           requested_for: scheduled.toISOString(),
           status: activeAction === 'propose' ? 'proposed' : 'accepted',
           response_message: this.$('#appointment-action-message').value.trim() || null
