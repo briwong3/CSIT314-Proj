@@ -21,11 +21,24 @@ class Permissions { // access matrix: which tabs each role may open
 class AuthController {
   async current() {
     const { data: { user } } = await db.auth.getUser(); if (!user) return null;
-    return new User({ ...must(await db.from('profiles').select('*').eq('id', user.id).single()), email: user.email });
+    const profile = must(await db.from('profiles').select('*').eq('id', user.id).maybeSingle());
+    if (!profile) {
+      throw new Error('Your sign-in succeeded, but your app profile is missing. Ask an administrator to run the latest schema migration in Supabase.');
+    }
+    return new User({ ...profile, email: user.email });
   }
   async login(email, password) {
     must(await db.auth.signInWithPassword({ email, password }));
-    const u = await this.current();
+    let u;
+    try {
+      u = await this.current();
+    } catch (error) {
+      const { error: signOutError } = await db.auth.signOut({ scope: 'local' });
+      if (signOutError) {
+        throw new Error(`${error.message} Sign-out cleanup also failed: ${signOutError.message}`);
+      }
+      throw error;
+    }
     if (u.isSuspended) { await this.logout(); throw new Error('This account is suspended. Contact an administrator.'); }
     return u;
   }
@@ -93,19 +106,29 @@ class DesignerController { // "find a designer": search, filter, sort, details
   updateCategory(id, fields) {
     return db.from('categories').update(fields).eq('id', id).then(must);
   }
+  async uploadProjectImage(designerId, imageFile) {
+    const safeName = imageFile.name.replace(/[^a-zA-Z0-9._-]/g, '_');
+    const path = `projects/${designerId}/${Date.now()}-${safeName}`;
+    const { error } = await db.storage.from('project-images').upload(path, imageFile, {
+      cacheControl: '3600',
+      upsert: false,
+      contentType: imageFile.type || 'application/octet-stream'
+    });
+    if (error) throw error;
+    return db.storage.from('project-images').getPublicUrl(path).data.publicUrl;
+  }
+  async removeProjectImage(imageUrl) {
+    if (!imageUrl) return null;
+    const marker = '/storage/v1/object/public/project-images/';
+    const index = imageUrl.indexOf(marker);
+    if (index < 0) return null;
+    const path = decodeURIComponent(imageUrl.slice(index + marker.length));
+    const { error } = await db.storage.from('project-images').remove([path]);
+    return error ? `The project image could not be removed: ${error.message}` : null;
+  }
   async createProject(fields, imageFile = null) {
     let imageUrl = null;
-    if (imageFile) {
-      const safeName = imageFile.name.replace(/[^a-zA-Z0-9._-]/g, '_');
-      const path = `projects/${fields.designer_id}/${Date.now()}-${safeName}`;
-      const { error: uploadError } = await db.storage.from('project-images').upload(path, imageFile, {
-        cacheControl: '3600',
-        upsert: false,
-        contentType: imageFile.type || 'application/octet-stream'
-      });
-      if (uploadError) throw uploadError;
-      imageUrl = db.storage.from('project-images').getPublicUrl(path).data.publicUrl;
-    }
+    if (imageFile) imageUrl = await this.uploadProjectImage(fields.designer_id, imageFile);
 
     return must(await db.from('projects').insert({
       designer_id: fields.designer_id,
@@ -119,10 +142,138 @@ class DesignerController { // "find a designer": search, filter, sort, details
       image_url: imageUrl
     }));
   }
-  async saveCompany(designerId, fields) {
-    const existing = must(await db.from('companies').select('id').eq('designer_id', designerId).limit(1).maybeSingle());
-    if (existing) return must(await db.from('companies').update(fields).eq('id', existing.id).eq('designer_id', designerId));
-    return must(await db.from('companies').insert({ designer_id: designerId, ...fields }));
+  async editProject(id, designerId) {
+    const [project, draft] = await Promise.all([
+      db.from('projects').select('*').eq('id', id).eq('designer_id', designerId).single(),
+      db.from('project_drafts').select('*').eq('project_id', id).eq('designer_id', designerId).maybeSingle()
+    ]);
+    const projectRow = must(project);
+    const draftRow = must(draft);
+    return {
+      project: { ...projectRow, ...(draftRow ?? {}) },
+      draft: draftRow
+    };
+  }
+  saveProjectDraft(projectId, designerId, fields) {
+    return db.from('project_drafts').upsert({
+      project_id: projectId,
+      designer_id: designerId,
+      ...fields,
+      updated_at: new Date().toISOString()
+    }, { onConflict: 'project_id' }).then(must);
+  }
+  async saveProjectChanges(projectId, designerId, fields, imageFile = null) {
+    const project = must(await db.from('projects')
+      .select('image_url')
+      .eq('id', projectId)
+      .eq('designer_id', designerId)
+      .single());
+    const imageUrl = imageFile ? await this.uploadProjectImage(designerId, imageFile) : null;
+    const update = await db.from('projects').update({
+      ...fields,
+      ...(imageUrl ? { image_url: imageUrl } : {})
+    }).eq('id', projectId).eq('designer_id', designerId);
+    if (update.error) {
+      if (imageUrl) {
+        try {
+          const cleanupWarning = await this.removeProjectImage(imageUrl);
+          if (cleanupWarning) throw new Error(cleanupWarning);
+        } catch (cleanupError) {
+          throw new Error(`${update.error.message} The uploaded replacement image could not be cleaned up: ${cleanupError.message}`);
+        }
+      }
+      throw update.error;
+    }
+
+    const draftDelete = await db.from('project_drafts')
+      .delete()
+      .eq('project_id', projectId)
+      .eq('designer_id', designerId);
+    if (draftDelete.error) {
+      throw new Error(`Project changes were saved, but the saved draft could not be cleared: ${draftDelete.error.message}`);
+    }
+
+    if (!imageUrl) return null;
+    try {
+      return await this.removeProjectImage(project.image_url);
+    } catch (error) {
+      return `Project changes were saved, but the previous image could not be removed: ${error.message}`;
+    }
+  }
+  async companyForEdit(designerId) {
+    const [profile, company, categories] = await Promise.all([
+      db.from('profiles').select('id,name').eq('id', designerId).single(),
+      db.from('companies').select('*').eq('designer_id', designerId).limit(1).maybeSingle(),
+      db.from('categories').select('*').order('name')
+    ]);
+    return {
+      profile: must(profile),
+      company: must(company),
+      categories: must(categories)
+    };
+  }
+  async saveCompany(designerId, fields, logoFile = null, coverFile = null) {
+    const existing = must(await db.from('companies')
+      .select('id,logo_url,cover_url')
+      .eq('designer_id', designerId)
+      .limit(1)
+      .maybeSingle());
+    const uploadedUrls = [];
+    let logoUrl;
+    let coverUrl;
+    try {
+      logoUrl = await this.uploadCompanyAsset(designerId, 'logo', logoFile);
+      if (logoUrl) uploadedUrls.push(logoUrl);
+      coverUrl = await this.uploadCompanyAsset(designerId, 'cover', coverFile);
+      if (coverUrl) uploadedUrls.push(coverUrl);
+
+      const values = {
+        ...fields,
+        ...(logoUrl ? { logo_url: logoUrl } : {}),
+        ...(coverUrl ? { cover_url: coverUrl } : {})
+      };
+      if (existing) {
+        must(await db.from('companies')
+          .update(values)
+          .eq('id', existing.id)
+          .eq('designer_id', designerId)
+          .select('id')
+          .single());
+      } else {
+        must(await db.from('companies')
+          .insert({ designer_id: designerId, ...values })
+          .select('id')
+          .single());
+      }
+    } catch (error) {
+      const cleanupWarnings = [];
+      for (const imageUrl of uploadedUrls) {
+        try {
+          const warning = await this.removeProjectImage(imageUrl);
+          if (warning) cleanupWarnings.push(warning);
+        } catch (cleanupError) {
+          cleanupWarnings.push(`An uploaded image could not be cleaned up: ${cleanupError.message}`);
+        }
+      }
+      if (cleanupWarnings.length) {
+        throw new Error(`${error.message} ${cleanupWarnings.join(' ')}`);
+      }
+      throw error;
+    }
+
+    const cleanupWarnings = [];
+    for (const oldUrl of [logoUrl && existing?.logo_url, coverUrl && existing?.cover_url]) {
+      if (!oldUrl) continue;
+      try {
+        const warning = await this.removeProjectImage(oldUrl);
+        if (warning) cleanupWarnings.push(warning);
+      } catch (error) {
+        cleanupWarnings.push(`A replaced image could not be removed: ${error.message}`);
+      }
+    }
+    return cleanupWarnings.length
+      ? `Company information was saved, but an old image could not be removed. ${cleanupWarnings.join(' ')}`
+      : null;
   }
   async uploadCompanyAsset(designerId, kind, file) {
     if (!file) return null;
@@ -140,6 +291,9 @@ class DesignerController { // "find a designer": search, filter, sort, details
     let query = db.from('project_activity').select('project_id,activity_type,created_at').eq('designer_id', designerId);
     if (from) query = query.gte('created_at', from);
     return must(await query.order('created_at'));
+  }
+  async designerProjectDrafts(designerId) {
+    return must(await db.from('project_drafts').select('project_id').eq('designer_id', designerId));
   }
   async designerAppointments(designerId) {
     return must(await db.from('appointment_requests')
@@ -251,13 +405,8 @@ class DesignerController { // "find a designer": search, filter, sort, details
   async deleteProject(id, designerId) {
     const project = must(await db.from('projects').select('image_url').eq('id', id).eq('designer_id', designerId).single());
     must(await db.from('projects').delete().eq('id', id).eq('designer_id', designerId));
-    if (!project.image_url) return null;
-    const marker = '/storage/v1/object/public/project-images/';
-    const index = project.image_url.indexOf(marker);
-    if (index < 0) return null;
-    const path = decodeURIComponent(project.image_url.slice(index + marker.length));
-    const { error } = await db.storage.from('project-images').remove([path]);
-    return error ? `Project was deleted, but its image could not be removed: ${error.message}` : null;
+    const cleanupWarning = await this.removeProjectImage(project.image_url);
+    return cleanupWarning ? `Project was deleted. ${cleanupWarning}` : null;
   }
   async designer(id) {
     const profile = must(await db.from('profiles').select('id,name').eq('id', id).single());
@@ -449,7 +598,16 @@ class App {
     if (this.user?.role !== 'admin') this.viewAs = null;
     if (this.user?.isSuspended) { await this.auth.logout(); this.user = null; }
     this.shell();
-    this.user ? this.open(Permissions.tabs(this.user.role)[0] ?? 'account') : this.homeView();
+    if (!this.user) {
+      this.homeView();
+      return;
+    }
+    const initialTab = Permissions.tabs(this.user.role)[0] ?? 'account';
+    try {
+      await this.open(initialTab);
+    } catch (error) {
+      this.show(`<section class="admin-content"><h1>${esc(this.labels[initialTab] ?? 'Page')} could not be loaded</h1><p class="err" role="alert">${esc(error.message)}</p></section>`);
+    }
   }
   shell() {
     this.inbox.user = this.user;
@@ -802,7 +960,7 @@ class App {
           if (error.message === 'Invalid login credentials') throw new Error('Incorrect email or password. Check your details and try again.');
           throw error;
         }
-        this.start();
+        await this.start();
       }
       else if (mode === 'register') {
         if (d.password !== d.confirmPassword) throw new Error('Passwords do not match.');
@@ -1970,11 +2128,13 @@ class App {
   async designerDashboardView() {
     const designerId = this.designerDashboardUserId;
     if (!designerId) throw new Error('No active interior designer is available to preview.');
-    const [{ projects }, categories] = await Promise.all([
+    const [{ projects }, categories, drafts] = await Promise.all([
       this.designers.designer(designerId),
-      this.designers.categories()
+      this.designers.categories(),
+      this.designers.designerProjectDrafts(designerId)
     ]);
     let activeFilter = 'all';
+    const draftProjectIds = new Set(drafts.map(draft => String(draft.project_id)));
     const categoriesById = new Map(categories.map(category => [category.id, category.name]));
     const categoryOptions = categories.map(category =>
       `<option value="${category.id}">${esc(category.name)}</option>`
@@ -2052,7 +2212,7 @@ class App {
         .filter(project => project.title.toLowerCase().includes(searchTerm))
         .filter(project => activeFilter === 'all'
           || (activeFilter === 'draft'
-            ? project.visibility === 'draft'
+            ? project.visibility === 'draft' || draftProjectIds.has(String(project.id))
             : project.visibility !== 'draft' && project.stage === activeFilter))
         .sort((left, right) => new Date(right.created_at).getTime() - new Date(left.created_at).getTime());
       this.$('#designer-project-rows').innerHTML = visibleProjects.map(project => `
@@ -2061,7 +2221,7 @@ class App {
           <td>${esc(categoriesById.get(project.category_id) ?? 'Interior design')}</td>
           <td><span class="designer-project-stage ${project.stage === 'ongoing' ? 'ongoing' : 'completed'}">${project.stage === 'ongoing' ? 'Ongoing' : 'Completed'}</span></td>
           <td><div class="designer-project-progress"><span><i style="width:${Math.max(0, Math.min(100, Number(project.progress ?? 0)))}%"></i></span>${Math.max(0, Math.min(100, Number(project.progress ?? 0)))}%</div></td>
-          <td><span class="designer-project-visibility ${project.visibility === 'draft' ? 'draft' : ''}">${project.visibility === 'draft' ? 'Draft' : 'Published'}</span></td>
+          <td><span class="designer-project-visibility ${project.visibility === 'draft' ? 'draft' : ''}">${project.visibility === 'draft' ? 'Draft' : 'Published'}</span>${draftProjectIds.has(String(project.id)) ? '<span class="designer-project-draft-tag">Draft changes</span>' : ''}</td>
           <td>${Number(project.views ?? 0).toLocaleString()}</td>
           <td>${Number(project.shortlists ?? 0).toLocaleString()}</td>
           <td><div class="designer-project-actions"><button type="button" class="designer-project-action" data-project-edit="${project.id}" ${this.isReadOnlyPreview ? 'disabled title="Editing is disabled in preview mode"' : ''}>Edit</button><button type="button" class="designer-project-action" data-project-delete="${project.id}" ${this.isReadOnlyPreview ? 'disabled title="Deleting is disabled in preview mode"' : ''}>Delete</button></div></td>
@@ -2191,7 +2351,13 @@ class App {
       if (editButton) {
         if (this.isReadOnlyPreview) return;
         const project = rowById(editButton.dataset.projectEdit);
-        if (project) showDialog(project);
+        if (project) {
+          try {
+            await this.editProjectView(project.id);
+          } catch (error) {
+            this.$('#designer-dashboard-error').textContent = error.message;
+          }
+        }
       } else if (deleteButton) {
         if (this.isReadOnlyPreview) return;
         const project = rowById(deleteButton.dataset.projectDelete);
@@ -2203,6 +2369,142 @@ class App {
       if (button) this.openDesignerDashboardView(button.dataset.designerView);
     };
     renderProjects();
+  }
+
+  async editProjectView(projectId) {
+    const designerId = this.designerDashboardUserId;
+    if (!designerId) throw new Error('No active interior designer is available to edit this project.');
+    const [{ project, draft }, categories] = await Promise.all([
+      this.designers.editProject(projectId, designerId),
+      this.designers.categories()
+    ]);
+    const categoryOptions = categories.map(category => `
+      <option value="${category.id}" ${String(category.id) === String(project.category_id) ? 'selected' : ''}>
+        ${esc(category.name)}
+      </option>`).join('');
+    this.showDesignerPage(`
+      <div class="designer-page-heading">
+        <div>
+          <h1>Edit project</h1>
+          <p>Update project details, cover image, stage or visibility.</p>
+        </div>
+      </div>
+      <form class="designer-company-form" id="edit-project-form">
+        <section class="designer-form-card">
+          <h2>Project details</h2>
+          ${draft ? '<p class="designer-draft-note">You have unsaved draft changes. Saving changes will apply them to the project.</p>' : ''}
+          <div class="designer-form-grid">
+            <label>Project title<input name="title" maxlength="120" value="${esc(project.title ?? '')}" required></label>
+            <label>Category<select name="category_id"><option value="">Select a category</option>${categoryOptions}</select></label>
+            <label>Budget (optional)<input name="budget" type="number" min="0" step="100" value="${esc(project.budget ?? '')}"></label>
+            <label>Completion date<input name="completion_date" type="date" value="${esc(project.completion_date ?? '')}"></label>
+            <label class="designer-form-full">Description<textarea name="description" rows="6" maxlength="2000">${esc(project.description ?? '')}</textarea></label>
+          </div>
+        </section>
+        <section class="designer-form-card">
+          <h2>Project photo</h2>
+          ${project.image_url
+            ? `<img class="designer-edit-project-image" id="edit-project-image-preview" src="${esc(project.image_url)}" alt="Current project cover photo">`
+            : '<p class="muted">No project photo has been uploaded.</p>'}
+          <label>Replace cover photo<input type="file" name="image" accept="image/*"></label>
+          <p class="muted">The existing photo is kept when no replacement is selected. Photo changes are applied when you save changes, not when saving a draft.</p>
+        </section>
+        <section class="designer-form-card">
+          <h2>Project stage</h2>
+          <div class="designer-form-grid">
+            <label>Stage<select name="stage"><option value="ongoing" ${project.stage === 'ongoing' ? 'selected' : ''}>Ongoing</option><option value="completed" ${project.stage === 'completed' ? 'selected' : ''}>Completed</option></select></label>
+            <label>Progress (%)<input type="number" name="progress" min="0" max="100" step="1" value="${Number(project.progress ?? 0)}" required></label>
+          </div>
+        </section>
+        <section class="designer-form-card">
+          <h2>Visibility</h2>
+          <div class="designer-form-grid">
+            <label>Who can see this project?<select name="visibility"><option value="draft" ${project.visibility === 'draft' ? 'selected' : ''}>Draft — only visible to you</option><option value="published" ${project.visibility !== 'draft' ? 'selected' : ''}>Published — visible to customers</option></select></label>
+          </div>
+        </section>
+        <p class="err" id="edit-project-error" role="alert"></p>
+        <div class="designer-company-actions">
+          <button type="button" class="designer-outline-button" id="edit-project-cancel">Cancel</button>
+          <button type="submit" class="designer-outline-button" name="saveDraftMode" value="draft" ${this.isReadOnlyPreview ? 'disabled' : ''}>Save as draft</button>
+          <button type="submit" class="btn designer-save-button" name="saveMode" value="save" ${this.isReadOnlyPreview ? 'disabled' : ''}>Save changes</button>
+        </div>
+      </form>
+    `, 'dashboard');
+
+    const form = this.$('#edit-project-form');
+    const imageInput = form.elements.namedItem('image');
+    imageInput.onchange = () => {
+      const file = imageInput.files?.[0];
+      if (!file) return;
+      const preview = this.$('#edit-project-image-preview');
+      if (preview) {
+        preview.src = URL.createObjectURL(file);
+      } else {
+        const image = document.createElement('img');
+        image.id = 'edit-project-image-preview';
+        image.className = 'designer-edit-project-image';
+        image.alt = 'Selected project cover photo';
+        image.src = URL.createObjectURL(file);
+        imageInput.closest('section').insertBefore(image, imageInput.closest('label'));
+      }
+    };
+    this.$('#edit-project-cancel').onclick = () => this.designerDashboardView();
+    form.onsubmit = async event => {
+      event.preventDefault();
+      if (this.isReadOnlyPreview) return;
+      const submitter = event.submitter;
+      const submitButtons = form.querySelectorAll('button[type="submit"]');
+      const errorElement = this.$('#edit-project-error');
+      const title = String(form.elements.namedItem('title').value ?? '').trim();
+      const budgetValue = form.elements.namedItem('budget').value;
+      const budget = budgetValue === '' ? null : Number(budgetValue);
+      const progress = Number(form.elements.namedItem('progress').value);
+      if (!title) {
+        errorElement.textContent = 'Project title is required.';
+        return;
+      }
+      if (budget !== null && (!Number.isFinite(budget) || budget < 0)) {
+        errorElement.textContent = 'Please enter a valid non-negative budget.';
+        return;
+      }
+      if (!Number.isInteger(progress) || progress < 0 || progress > 100) {
+        errorElement.textContent = 'Progress must be a whole number between 0 and 100.';
+        return;
+      }
+      const fields = {
+        title,
+        description: String(form.elements.namedItem('description').value ?? '').trim() || null,
+        category_id: form.elements.namedItem('category_id').value
+          ? Number(form.elements.namedItem('category_id').value)
+          : null,
+        budget,
+        completion_date: form.elements.namedItem('completion_date').value || null,
+        stage: form.elements.namedItem('stage').value,
+        progress,
+        visibility: form.elements.namedItem('visibility').value
+      };
+      submitButtons.forEach(button => { button.disabled = true; });
+      errorElement.textContent = '';
+      try {
+        if (submitter?.name === 'saveDraftMode') {
+          await this.designers.saveProjectDraft(projectId, designerId, fields);
+          await this.designerDashboardView();
+          this.$('#designer-dashboard-error').textContent = 'Draft saved. Your project has not been changed.';
+          return;
+        }
+        const warning = await this.designers.saveProjectChanges(
+          projectId,
+          designerId,
+          fields,
+          imageInput.files?.[0] ?? null
+        );
+        await this.designerDashboardView();
+        if (warning) this.$('#designer-dashboard-error').textContent = warning;
+      } catch (error) {
+        errorElement.textContent = error.message;
+        submitButtons.forEach(button => { button.disabled = false; });
+      }
+    };
   }
 
   showProjectDeleteDialog(project) {
@@ -2221,48 +2523,62 @@ class App {
   async companyInformationView() {
     const designerId = this.designerDashboardUserId;
     if (!designerId) throw new Error('No active interior designer is available to preview.');
-    const { profile, company } = await this.designers.designer(designerId);
-    const categories = await this.designers.categories();
+    const { profile, company, categories } = await this.designers.companyForEdit(designerId);
     const specialties = Array.isArray(company?.specialties) ? company.specialties : [];
     const designAreas = Array.isArray(company?.design_areas) ? company.design_areas : [];
-    const services = company?.services ?? '';
     const areas = ['Living room', 'Bedroom', 'Kitchen', 'Bathroom', 'Home office', 'Outdoor'];
-    const specialtyInputs = categories.map(category => `
-      <label class="designer-check"><input type="checkbox" name="specialties" value="${esc(category.name)}" ${specialties.includes(category.name) ? 'checked' : ''}><span>${esc(category.name)}</span></label>`).join('');
-    const areaInputs = areas.map(area => `
-      <label class="designer-check"><input type="checkbox" name="design_areas" value="${area}" ${designAreas.includes(area) ? 'checked' : ''}><span>${area}</span></label>`).join('');
+    const checkbox = (name, value, checked) => `
+      <label class="designer-check">
+        <input type="checkbox" name="${name}" value="${esc(value)}" ${checked ? 'checked' : ''}>
+        <span>${esc(value)}</span>
+      </label>`;
     this.showDesignerPage(`
       <div class="designer-page-heading">
         <div><h1>Company profile</h1><p>This is what customers see on your public company page.</p></div>
-        <button type="button" class="designer-outline-button" id="view-public-profile">View public profile</button>
+        <button type="button" class="designer-outline-button" id="view-public-profile">Public profile</button>
       </div>
-      <div class="designer-company-tabs" role="tablist" aria-label="Company profile sections">
-        <button type="button" class="active" id="company-information-tab" role="tab" aria-selected="true">Company information</button>
-        <button type="button" id="company-preview-toggle" role="tab" aria-selected="false">Public preview</button>
-      </div>
-      <div class="designer-company-preview" id="company-preview" hidden></div>
-      <form class="designer-company-form" id="designer-company-form">
+      <form class="designer-company-form" id="edit-company-page">
         <section class="designer-form-card">
           <h2>Branding</h2>
           <div class="designer-branding-grid">
-            <div class="designer-branding-logo"><span>Logo</span><div><img class="designer-brand-preview logo" src="${esc(company?.logo_url ?? '')}" alt="Company logo" ${company?.logo_url ? '' : 'hidden'}><span class="designer-brand-placeholder" ${company?.logo_url ? 'hidden' : ''}></span><label for="company-logo-upload" class="designer-outline-button">${company?.logo_url ? 'Change logo' : 'Add logo'}</label><input id="company-logo-upload" class="designer-upload-input" type="file" name="logo" accept="image/*"></div></div>
-            <div class="designer-branding-cover"><span>Cover photo</span><label for="company-cover-upload">${company?.cover_url ? `<img class="designer-brand-preview cover" src="${esc(company.cover_url)}" alt="Current company cover photo">` : '<span>Upload a cover photo</span>'}<input id="company-cover-upload" class="designer-upload-input" type="file" name="cover" accept="image/*"></label></div>
+            <div class="designer-branding-logo">
+              <span>Logo</span>
+              <div>
+                <img class="designer-brand-preview logo" src="${esc(company?.logo_url ?? '')}" alt="Company logo" ${company?.logo_url ? '' : 'hidden'}>
+                <span class="designer-brand-placeholder" ${company?.logo_url ? 'hidden' : ''}></span>
+                <label for="company-logo" class="designer-outline-button">${company?.logo_url ? 'Change logo' : 'Add logo'}</label>
+                <input id="company-logo" class="designer-upload-input" type="file" name="logo" accept="image/*">
+              </div>
+            </div>
+            <div class="designer-branding-cover">
+              <span>Cover photo</span>
+              <label for="company-cover">
+                ${company?.cover_url ? `<img class="designer-brand-preview cover" src="${esc(company.cover_url)}" alt="Company cover photo">` : '<span>Upload a cover photo</span>'}
+                <input id="company-cover" class="designer-upload-input" type="file" name="cover" accept="image/*">
+              </label>
+            </div>
           </div>
         </section>
-        <section class="designer-form-card designer-company-details">
+        <section class="designer-form-card">
           <h2>Company information</h2>
           <div class="designer-form-grid">
             <label>Company name<input name="name" maxlength="120" value="${esc(company?.name ?? profile.name)}" required></label>
             <label>Year established<input name="year_established" type="number" min="1800" max="${new Date().getFullYear()}" value="${esc(company?.year_established ?? '')}" placeholder="e.g. 2015"></label>
             <label class="designer-form-full">Tagline<input name="tagline" maxlength="160" value="${esc(company?.tagline ?? '')}" placeholder="A short introduction"></label>
-            <label class="designer-form-full">About the company<textarea name="bio" rows="3" maxlength="2000">${esc(company?.bio ?? '')}</textarea></label>
-            <fieldset class="designer-form-full"><legend>Specialties</legend><div class="designer-check-list">${specialtyInputs || '<span class="muted">Add categories to select specialties.</span>'}</div></fieldset>
+            <label class="designer-form-full">About the company<textarea name="bio" rows="5" maxlength="2000">${esc(company?.bio ?? '')}</textarea></label>
+            <fieldset class="designer-form-full">
+              <legend>Specialties</legend>
+              <div class="designer-check-list">${categories.map(category => checkbox('specialties', category.name, specialties.includes(category.name))).join('') || '<span class="muted">Add categories to select specialties.</span>'}</div>
+            </fieldset>
           </div>
         </section>
         <section class="designer-form-card">
           <h2>Services offered</h2>
-          <label>Services offered (one per line)<textarea name="services" rows="3" maxlength="2000">${esc(services)}</textarea></label>
-          <fieldset><legend>Areas of design</legend><div class="designer-check-list">${areaInputs}</div></fieldset>
+          <label>Services offered (one per line)<textarea name="services" rows="4" maxlength="2000">${esc(company?.services ?? '')}</textarea></label>
+          <fieldset>
+            <legend>Areas of design</legend>
+            <div class="designer-check-list">${areas.map(area => checkbox('design_areas', area, designAreas.includes(area))).join('')}</div>
+          </fieldset>
         </section>
         <section class="designer-form-card">
           <h2>Contact details</h2>
@@ -2274,58 +2590,40 @@ class App {
           </div>
         </section>
         <p class="err designer-company-error" role="alert"></p>
-        <div class="designer-company-actions"><button class="designer-outline-button" id="discard-company-changes" type="button">Discard changes</button><button class="btn designer-save-button" type="submit">Save changes</button></div>
+        <div class="designer-company-actions">
+          <button class="designer-outline-button" id="discard-company-changes" type="button">Discard changes</button>
+          <button class="btn designer-save-button" type="submit" ${this.isReadOnlyPreview ? 'disabled' : ''}>Save changes</button>
+        </div>
       </form>
     `, 'company', 'designer-company-page');
-    const form = this.$('#designer-company-form');
-    const preview = this.$('#company-preview');
-    const companyTab = this.$('#company-information-tab');
-    const previewTab = this.$('#company-preview-toggle');
-    const switchCompanyTab = showPreview => {
-      preview.hidden = !showPreview;
-      form.hidden = showPreview;
-      companyTab.classList.toggle('active', !showPreview);
-      companyTab.setAttribute('aria-selected', String(!showPreview));
-      previewTab.classList.toggle('active', showPreview);
-      previewTab.setAttribute('aria-selected', String(showPreview));
-    };
-    companyTab.onclick = () => switchCompanyTab(false);
+    const form = this.$('#edit-company-page');
+    const logoInput = this.$('#company-logo');
+    const coverInput = this.$('#company-cover');
+    const logoImage = this.$('.designer-brand-preview.logo');
+    const coverLabel = coverInput.closest('label');
     this.$('#view-public-profile').onclick = () => this.designerView(profile.id);
     this.$('#discard-company-changes').onclick = () => {
-      form.reset();
-      logoImage.src = company?.logo_url ?? '';
-      logoImage.hidden = !company?.logo_url;
-      this.$('.designer-brand-placeholder').hidden = Boolean(company?.logo_url);
-      const coverLabel = coverInput.closest('label');
-      coverLabel.querySelector('.designer-brand-preview')?.remove();
-      coverLabel.querySelector('span')?.remove();
-      if (company?.cover_url) {
-        const image = document.createElement('img');
-        image.className = 'designer-brand-preview cover';
-        image.src = company.cover_url;
-        image.alt = 'Current company cover photo';
-        coverLabel.prepend(image);
-      } else {
-        const placeholder = document.createElement('span');
-        placeholder.textContent = 'Upload a cover photo';
-        coverLabel.prepend(placeholder);
-      }
-      this.$('.designer-company-error').textContent = '';
+      this.companyInformationView().catch(error => {
+        this.$('.designer-company-error').textContent = error.message;
+      });
     };
-    const logoInput = this.$('#company-logo-upload');
-    const logoImage = this.$('.designer-brand-preview.logo');
     logoInput.onchange = () => {
-      const file = logoInput.files[0];
+      const file = logoInput.files?.[0];
       if (!file) return;
-      logoImage.src = URL.createObjectURL(file);
-      logoImage.hidden = false;
+      let previewImage = logoImage;
+      if (!previewImage) {
+        previewImage = document.createElement('img');
+        previewImage.className = 'designer-brand-preview logo';
+        previewImage.alt = 'Selected company logo';
+        logoInput.closest('.designer-branding-logo').querySelector('div').prepend(previewImage);
+      }
+      previewImage.src = URL.createObjectURL(file);
+      previewImage.hidden = false;
       this.$('.designer-brand-placeholder').hidden = true;
     };
-    const coverInput = this.$('#company-cover-upload');
     coverInput.onchange = () => {
-      const file = coverInput.files[0];
+      const file = coverInput.files?.[0];
       if (!file) return;
-      const coverLabel = coverInput.closest('label');
       coverLabel.querySelector('.designer-brand-preview')?.remove();
       coverLabel.querySelector('span')?.remove();
       const image = document.createElement('img');
@@ -2335,26 +2633,21 @@ class App {
       coverLabel.prepend(image);
     };
     if (this.isReadOnlyPreview) {
-      form.querySelectorAll('input,textarea,button[type="submit"],.designer-upload-input').forEach(control => {
+      form.querySelectorAll('input,textarea,button[type="submit"]').forEach(control => {
         control.disabled = true;
       });
       this.$('#discard-company-changes').disabled = true;
     }
-    this.$('#company-preview-toggle').onclick = () => {
-      const field = name => form.elements.namedItem(name)?.value ?? '';
-      const checked = name => [...form.querySelectorAll(`[name="${name}"]:checked`)].map(input => input.value);
-      preview.innerHTML = `<h2>${esc(field('name') || 'Company name')}</h2>
-        <p>${esc(field('tagline'))}</p>
-        <p>${esc(field('bio') || 'Add a company description to preview it here.')}</p>
-        <p><strong>Specialties:</strong> ${esc(checked('specialties').join(', ') || 'None selected')}</p>
-        <p><strong>Services:</strong> ${esc(String(field('services')).split('\n').filter(Boolean).join(' · ') || 'None listed')}</p>
-        <p><strong>Areas:</strong> ${esc(checked('design_areas').join(', ') || 'None selected')}</p>`;
-      switchCompanyTab(true);
-    };
     form.onsubmit = async event => {
       event.preventDefault();
       if (this.isReadOnlyPreview) return;
       const values = new FormData(form);
+      const text = key => String(values.get(key) ?? '').trim() || null;
+      const name = text('name');
+      if (!name) {
+        this.$('.designer-company-error').textContent = 'Company name is required.';
+        return;
+      }
       const year = String(values.get('year_established') ?? '').trim();
       const yearEstablished = year ? Number(year) : null;
       if (yearEstablished !== null && (!Number.isInteger(yearEstablished) || yearEstablished < 1800 || yearEstablished > new Date().getFullYear())) {
@@ -2365,12 +2658,8 @@ class App {
       submit.disabled = true;
       this.$('.designer-company-error').textContent = '';
       try {
-        const [logoUrl, coverUrl] = await Promise.all([
-          this.designers.uploadCompanyAsset(designerId, 'logo', form.elements.namedItem('logo').files[0]),
-          this.designers.uploadCompanyAsset(designerId, 'cover', form.elements.namedItem('cover').files[0])
-        ]);
-        await this.designers.saveCompany(designerId, {
-          name: String(values.get('name')).trim(),
+        const warning = await this.designers.saveCompany(designerId, {
+          name,
           tagline: String(values.get('tagline') ?? '').trim() || null,
           year_established: yearEstablished,
           bio: String(values.get('bio') ?? '').trim() || null,
@@ -2381,14 +2670,13 @@ class App {
           phone: String(values.get('phone') ?? '').trim() || null,
           website: String(values.get('website') ?? '').trim() || null,
           address: String(values.get('address') ?? '').trim() || null,
-          ...(logoUrl ? { logo_url: logoUrl } : {}),
-          ...(coverUrl ? { cover_url: coverUrl } : {})
-        });
+        }, logoInput.files?.[0] ?? null, coverInput.files?.[0] ?? null);
         await this.companyInformationView();
+        if (warning) this.$('.designer-company-error').textContent = warning;
       } catch (error) {
-        this.$('.designer-company-error').textContent = error.message;
+        if (form.isConnected) this.$('.designer-company-error').textContent = error.message;
       } finally {
-        submit.disabled = false;
+        if (submit.isConnected) submit.disabled = false;
       }
     };
   }

@@ -575,10 +575,13 @@ main.project-detail-main{max-width:1240px;margin:20px auto;padding:0 24px}
 .designer-project-dialog{width:min(500px,calc(100% - 32px))}
 .designer-project-dialog .err:empty{display:none}
 .designer-project-image-field[hidden]{display:none!important}
+.designer-edit-project-image{display:block;width:min(100%,520px);max-height:300px;margin:0 0 12px;border:1px solid #dfe3eb;border-radius:9px;object-fit:cover}
+.designer-draft-note{margin:0 0 12px;padding:9px 11px;border-radius:7px;background:#fff5df;color:#6b4c15;font-size:12px}
 .designer-project-stage,.designer-project-visibility{display:inline-block;padding:4px 9px;border-radius:99px;background:#e8eaf2;color:#344158;font-size:10px;white-space:nowrap}
 .designer-project-stage.ongoing{background:#fff0d3}
 .designer-project-stage.completed{background:#e8eaf2}
 .designer-project-visibility.draft{background:#fff0d3}
+.designer-project-draft-tag{display:block;margin-top:4px;color:#8a5e0b;font-size:10px;font-weight:600;white-space:nowrap}
 .designer-project-progress{display:flex;align-items:center;gap:6px;white-space:nowrap;font-size:10px}
 .designer-project-progress>span{display:block;width:54px;height:6px;overflow:hidden;border-radius:99px;background:#e6e9f0}
 .designer-project-progress i{display:block;height:100%;border-radius:inherit;background:#3b4a6b}
