@@ -127,10 +127,11 @@ alter table notifications enable row level security;
 alter table public.feedback enable row level security;
 
 create policy cat_read on categories for select to authenticated using (true);
-grant select on public.categories to authenticated;
 drop policy if exists categories_platform_insert on public.categories;
 create policy categories_platform_insert on public.categories for insert to authenticated
   with check (my_role()='platform');
+grant select, insert, update, delete on public.categories to authenticated;
+grant usage, select on sequence public.categories_id_seq to authenticated;
 drop policy if exists categories_platform_update on public.categories;
 create policy categories_platform_update on public.categories for update to authenticated
   using (my_role()='platform') with check (my_role()='platform');
@@ -657,6 +658,99 @@ where not exists (
 on conflict (id) do nothing;
 
 grant select, update on public.profiles to authenticated;
-grant select on public.categories to authenticated;
+
+-- Platform category reassignment and safe-delete migration.
+create or replace function public.platform_category_usage(p_category_id integer)
+returns table(category_name text, project_count bigint, draft_count bigint)
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  if auth.uid() is null or not exists (
+    select 1
+    from public.profiles p
+    where p.id = auth.uid() and p.role = 'platform' and p.status = 'active'
+  ) then
+    raise exception using errcode = '42501', message = 'Platform manager access required';
+  end if;
+
+  if not exists (
+    select 1 from public.categories c where c.id = p_category_id
+  ) then
+    raise exception using errcode = 'P0002', message = 'Category not found';
+  end if;
+
+  return query
+  select
+    c.name,
+    (select count(*) from public.projects p where p.category_id = c.id),
+    (select count(*) from public.project_drafts d where d.category_id = c.id)
+  from public.categories c
+  where c.id = p_category_id;
+end;
+$$;
+
+create or replace function public.platform_move_and_delete_category(
+  p_category_id integer,
+  p_target_category_id integer default null
+)
+returns void
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  project_total bigint;
+  draft_total bigint;
+begin
+  if auth.uid() is null or not exists (
+    select 1
+    from public.profiles p
+    where p.id = auth.uid() and p.role = 'platform' and p.status = 'active'
+  ) then
+    raise exception using errcode = '42501', message = 'Platform manager access required';
+  end if;
+
+  perform 1 from public.categories c where c.id = p_category_id for update;
+  if not found then
+    raise exception using errcode = 'P0002', message = 'Category not found';
+  end if;
+
+  if p_target_category_id = p_category_id then
+    raise exception using errcode = '22023', message = 'Choose a different category';
+  end if;
+  if p_target_category_id is not null then
+    perform 1 from public.categories c where c.id = p_target_category_id for key share;
+    if not found then
+      raise exception using errcode = 'P0002', message = 'Destination category not found';
+    end if;
+  end if;
+
+  select count(*) into project_total
+  from public.projects p where p.category_id = p_category_id;
+  select count(*) into draft_total
+  from public.project_drafts d where d.category_id = p_category_id;
+  if project_total + draft_total > 0 and p_target_category_id is null then
+    raise exception using errcode = '23503', message = 'Choose a category for projects before deleting';
+  end if;
+
+  if p_target_category_id is not null then
+    update public.projects
+    set category_id = p_target_category_id
+    where category_id = p_category_id;
+    update public.project_drafts
+    set category_id = p_target_category_id
+    where category_id = p_category_id;
+  end if;
+
+  delete from public.categories c where c.id = p_category_id;
+end;
+$$;
+
+revoke all on function public.platform_category_usage(integer) from public, anon;
+grant execute on function public.platform_category_usage(integer) to authenticated;
+revoke all on function public.platform_move_and_delete_category(integer, integer) from public, anon;
+grant execute on function public.platform_move_and_delete_category(integer, integer) to authenticated;
 
 notify pgrst, 'reload schema';

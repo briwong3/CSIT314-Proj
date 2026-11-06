@@ -106,6 +106,15 @@ class DesignerController { // "find a designer": search, filter, sort, details
   updateCategory(id, fields) {
     return db.from('categories').update(fields).eq('id', id).then(must);
   }
+  async categoryUsage(id) {
+    return must(await db.rpc('platform_category_usage', { p_category_id: Number(id) }));
+  }
+  async moveAndDeleteCategory(id, targetId) {
+    return must(await db.rpc('platform_move_and_delete_category', {
+      p_category_id: Number(id),
+      p_target_category_id: targetId == null ? null : Number(targetId)
+    }));
+  }
   async uploadProjectImage(designerId, imageFile) {
     const safeName = imageFile.name.replace(/[^a-zA-Z0-9._-]/g, '_');
     const path = `projects/${designerId}/${Date.now()}-${safeName}`;
@@ -1490,7 +1499,7 @@ class App {
           </div>
           <button type="button" class="idp-primary-button" id="add-category">+ Add category</button>
         </div>
-        <div class="idp-metrics">
+        <div class="idp-metrics idp-category-metrics">
           <article class="idp-metric"><span class="idp-metric-label">Categories</span><strong>${rows.length}</strong></article>
           <article class="idp-metric"><span class="idp-metric-label">Projects categorised</span><strong>${projectCount.toLocaleString()}</strong></article>
           <article class="idp-most-viewed"><div><strong>${esc(topCategory?.name ?? '—')}</strong><span>${Number(topCategory?.views ?? 0).toLocaleString()} views</span></div><div class="meta">Most viewed</div></article>
@@ -1499,8 +1508,9 @@ class App {
           <h2>All categories</h2>
           <table class="idp-table">
             <thead><tr><th>Name</th><th>Description</th><th>Projects</th><th>Views (all time)</th><th style="width:180px;">Actions</th></tr></thead>
-            <tbody>${rows.map(row => `<tr><td>${esc(row.name)}</td><td>${esc(row.description ?? '') || '—'}</td><td>${row.projects}</td><td>${Number(row.views).toLocaleString()}</td><td><div class="idp-actions"><button type="button" class="idp-action-btn" data-edit-category="${row.id}">Edit</button><button type="button" class="idp-action-btn danger">Delete</button></div></td></tr>`).join('') || '<tr><td colspan="5">No categories yet.</td></tr>'}</tbody>
+            <tbody>${rows.map(row => `<tr><td>${esc(row.name)}</td><td>${esc(row.description ?? '') || '—'}</td><td>${row.projects}</td><td>${Number(row.views).toLocaleString()}</td><td><div class="idp-actions"><button type="button" class="idp-action-btn" data-edit-category="${row.id}">Edit</button><button type="button" class="idp-action-btn danger" data-delete-category="${row.id}">Delete</button></div></td></tr>`).join('') || '<tr><td colspan="5">No categories yet.</td></tr>'}</tbody>
           </table>
+          <p class="err category-page-error" role="alert"></p>
         </section>
       </div>
       <dialog class="account-edit-dialog category-dialog" id="category-dialog" aria-labelledby="category-dialog-title">
@@ -1520,12 +1530,39 @@ class App {
           </div>
         </form>
       </dialog>
+      <dialog class="account-edit-dialog category-delete-dialog" id="category-delete-dialog" aria-labelledby="category-delete-title" aria-describedby="category-delete-copy">
+        <form id="category-delete-form">
+          <div class="account-edit-heading">
+            <h2 id="category-delete-title">Delete category?</h2>
+            <button type="button" class="account-modal-close" id="close-category-delete" aria-label="Close dialog">×</button>
+          </div>
+          <p class="category-delete-copy" id="category-delete-copy">Checking category usage…</p>
+          <label id="category-move-field" hidden>Move projects to
+            <select id="category-move-target" name="target" required disabled>
+              <option value="">Select a category</option>
+            </select>
+          </label>
+          <p class="err category-delete-error" role="alert"></p>
+          <div class="account-edit-actions">
+            <button type="button" class="btn secondary-btn" id="cancel-category-delete">Cancel</button>
+            <button type="submit" class="btn danger-btn" id="confirm-category-delete" disabled>Delete category</button>
+          </div>
+        </form>
+      </dialog>
     </section>`);
     this.bindPlatformNavigation();
     const dialog = this.$('#category-dialog');
     const form = this.$('#category-form');
+    const deleteDialog = this.$('#category-delete-dialog');
+    const deleteForm = this.$('#category-delete-form');
+    const deleteTarget = this.$('#category-move-target');
+    const deleteButton = this.$('#confirm-category-delete');
+    let categoryToDelete = null;
+    let categoryUsage = null;
+    let deleteRequest = 0;
     const openDialog = category => {
       form.reset();
+      this.$('.category-modal-error').textContent = '';
       form.elements.namedItem('id').value = category?.id ?? '';
       form.elements.namedItem('name').value = category?.name ?? '';
       form.elements.namedItem('description').value = category?.description ?? '';
@@ -1537,16 +1574,98 @@ class App {
       dialog.showModal();
       form.elements.namedItem('name').focus();
     };
+    const openDeleteDialog = async category => {
+      const request = ++deleteRequest;
+      categoryToDelete = category;
+      categoryUsage = null;
+      deleteForm.reset();
+      this.$('#category-delete-title').textContent = `Delete “${category.name}”?`;
+      this.$('#category-delete-copy').textContent = 'Checking category usage…';
+      this.$('.category-delete-error').textContent = '';
+      this.$('#category-move-field').hidden = true;
+      deleteTarget.disabled = true;
+      deleteTarget.required = false;
+      deleteButton.disabled = true;
+      deleteDialog.showModal();
+      try {
+        const [usage] = await this.designers.categoryUsage(category.id);
+        if (request !== deleteRequest) return;
+        if (!usage) throw new Error('Could not find category usage information.');
+        const projectCount = Number(usage.project_count);
+        const draftCount = Number(usage.draft_count);
+        if (!Number.isSafeInteger(projectCount) || !Number.isSafeInteger(draftCount)) {
+          throw new Error('Category usage information is invalid.');
+        }
+        categoryUsage = { projectCount, draftCount };
+        const usageParts = [];
+        if (projectCount) usageParts.push(`${projectCount} ${projectCount === 1 ? 'project' : 'projects'}`);
+        if (draftCount) usageParts.push(`${draftCount} saved ${draftCount === 1 ? 'draft' : 'drafts'}`);
+        this.$('#category-delete-copy').textContent = usageParts.length
+          ? `${usageParts.join(' and ')} use this category. Move them to another category before deleting. This cannot be undone.`
+          : 'No projects use this category. This cannot be undone.';
+
+        if (usageParts.length) {
+          const otherCategories = rows.filter(row => String(row.id) !== String(category.id));
+          this.$('#category-move-field').hidden = false;
+          deleteTarget.innerHTML = `<option value="">Select a category</option>${otherCategories.map(row => `<option value="${esc(row.id)}">${esc(row.name)}</option>`).join('')}`;
+          deleteTarget.disabled = otherCategories.length === 0;
+          deleteTarget.required = otherCategories.length > 0;
+          deleteButton.disabled = otherCategories.length === 0;
+          if (otherCategories.length === 0) {
+            this.$('.category-delete-error').textContent = 'Create another category before deleting this one.';
+          }
+        } else {
+          deleteTarget.innerHTML = '<option value="">Select a category</option>';
+          deleteButton.disabled = false;
+        }
+      } catch (error) {
+        if (request !== deleteRequest) return;
+        this.$('#category-delete-copy').textContent = 'Category usage could not be checked. Try again.';
+        this.$('.category-delete-error').textContent = error.message;
+      }
+    };
     this.$('#add-category').onclick = () => openDialog(null);
     this.$('#close-category-dialog').onclick = () => dialog.close();
     this.$('#cancel-category-dialog').onclick = () => dialog.close();
+    this.$('#close-category-delete').onclick = () => deleteDialog.close();
+    this.$('#cancel-category-delete').onclick = () => deleteDialog.close();
+    deleteDialog.onclose = () => { deleteRequest += 1; };
+    deleteTarget.onchange = () => {
+      deleteButton.disabled = !categoryUsage ||
+        (categoryUsage.projectCount + categoryUsage.draftCount > 0 && !deleteTarget.value);
+    };
     this.$('.idp-table').onclick = e => {
       const edit = e.target.closest('[data-edit-category]');
       if (edit) openDialog(rows.find(row => String(row.id) === edit.dataset.editCategory));
     };
+    this.$('.idp-table-card').onclick = this.guard(async e => {
+      const deleteButton = e.target.closest('[data-delete-category]');
+      if (!deleteButton) return;
+      this.$('.category-page-error').textContent = '';
+      const category = rows.find(row => String(row.id) === deleteButton.dataset.deleteCategory);
+      if (!category) throw new Error('This category is no longer available.');
+      await openDeleteDialog(category);
+    });
     dialog.onclick = e => {
       if (e.target === dialog) dialog.close();
     };
+    deleteDialog.onclick = e => {
+      if (e.target === deleteDialog) deleteDialog.close();
+    };
+    deleteForm.onsubmit = this.guard(async () => {
+      if (!categoryToDelete || !categoryUsage) throw new Error('Category usage has not been checked.');
+      const hasReferences = categoryUsage.projectCount + categoryUsage.draftCount > 0;
+      const targetId = hasReferences ? deleteTarget.value : null;
+      if (hasReferences && !targetId) throw new Error('Select a category to move the projects to.');
+      deleteButton.disabled = true;
+      try {
+        await this.designers.moveAndDeleteCategory(categoryToDelete.id, targetId);
+        deleteDialog.close();
+        await this.categoriesView();
+      } finally {
+        deleteButton.disabled = false;
+      }
+    });
     form.onsubmit = this.guard(async () => {
       const id = form.elements.namedItem('id').value;
       const fields = {
@@ -2061,7 +2180,6 @@ class App {
             <p>Platform activity at a glance · <span>today's date</span></p>
           </div>
           <div class="idp-header-actions">
-            <button type="button" class="idp-primary-button" data-nav="categories">+ Add category</button>
             <button type="button" class="idp-secondary-button" data-nav="dailyReport">Daily report</button>
             <button type="button" class="idp-secondary-button" data-nav="monthlyReport">Monthly report</button>
           </div>

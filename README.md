@@ -33,6 +33,8 @@ The schema also creates the public `project-images` Storage bucket used when des
 
 The designer dashboard adds a repeatable migration block at the bottom of `schema.sql`, starting with **Designer dashboard profile, project workflow and view-history migration**. If the rest of the schema is already installed, run only that block in the Supabase SQL Editor to enable company profiles, project stages, project editing and draft records, workflow sharing, view history, 100-view project milestones, and structured appointment requests. The project editor stores draft edits in `project_drafts`, applies saved edits to `projects`, and supports replacing the existing single project image. New view history and milestone notices start when the migration is applied; they cannot reconstruct events from existing aggregate view counts.
 
+The platform manager's category delete dialog uses the **Platform category reassignment and safe-delete migration** at the bottom of `schema.sql`. Run that section after the designer dashboard migration to enable usage checks and move projects and drafts to another category before deletion.
+
 If the app reports **Bucket not found** while creating a project or uploading a company logo/cover, open the Supabase SQL Editor for the project configured in `config.js` and run the **Storage bucket used for project photos** section in `schema.sql`. This section is safe to run again. Then retry the upload.
 
 ### Create the first User Admin
@@ -123,6 +125,7 @@ The daily, weekly, and monthly platform report pages currently display sample fi
 - **Login says the app profile is missing:** run the latest designer-dashboard migration block at the bottom of `schema.sql`. It restores missing profiles from signup metadata; restored accounts receive the customer or designer role, while admin/platform roles must be reassigned by an administrator.
 - **The signed-in header appears but the login form stays visible or the first page fails to load:** run the latest schema in the Supabase SQL Editor. Authenticated users need `SELECT` on `public.categories` as well as the `cat_read` row-level security policy. The app now displays the page-load error instead of silently leaving the login form visible.
 - **Permission denied / row-level security error:** verify that the relevant policies in `schema.sql` were applied and that the signed-in account has the intended role.
+- **Platform Manager sees `permission denied for table categories` when managing categories:** run the category grants in `schema.sql` in the SQL Editor for the project configured in `config.js`. Row-level security remains enabled, so the category policies still limit changes to Platform Managers. If category deletion reports that its usage checks are unavailable, also run the **Platform category reassignment and safe-delete migration** at the bottom of `schema.sql`, after the designer dashboard migration.
 - **Admin account actions fail:** confirm the `admin-users` function is deployed to the configured project and its `SUPABASE_SERVICE_ROLE_KEY` secret is set.
 - **Email change remains pending:** the user may need to confirm the new address. Profile email is synchronized when Supabase Auth applies the email update.
 - **JavaScript module/CORS error:** serve the app from `http://localhost` or a deployed HTTPS static host; don't open the HTML file directly.

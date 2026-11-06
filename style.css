@@ -495,6 +495,7 @@ main.project-detail-main{max-width:1240px;margin:20px auto;padding:0 24px}
 .idp-header p{margin:0;color:#666e7d;font-size:16px}
 .idp-primary-button{border:1px solid #2c3d55;background:#2E3C4F;color:#fff;border-radius:10px;padding:12px 20px;font:inherit;font-weight:700;cursor:pointer;box-shadow:0 6px 12px rgba(46,60,79,.12)}
 .idp-metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px;margin-bottom:22px}
+.idp-category-metrics{grid-template-columns:repeat(3,minmax(0,1fr))}
 .idp-metric{background:#f7f7f9;border:1px solid #dfe3eb;border-radius:12px;padding:18px 16px;min-height:110px;display:flex;flex-direction:column;justify-content:center}
 .idp-metric-label{display:block;color:#677184;font-size:13px;margin-bottom:6px}
 .idp-metric strong{display:block;font-size:40px;line-height:1;color:#202735;letter-spacing:-.06em}
@@ -755,8 +756,21 @@ main.project-detail-main{max-width:1240px;margin:20px auto;padding:0 24px}
 .category-dialog textarea{min-height:76px;resize:vertical}
 .category-modal-note{margin:0;color:#69758a;font-size:12px;line-height:1.5}
 .category-modal-error:empty{display:none}
+.category-page-error:empty{display:none}
 .category-dialog .account-edit-actions .btn{min-height:44px;background:var(--navy);color:#fff;font-weight:700}
 .category-dialog .account-edit-actions .secondary-btn{border:1px solid var(--navy);background:#fff;color:var(--navy);font-weight:400}
+.category-delete-dialog{width:min(460px,calc(100% - 32px))}
+.category-delete-dialog form{gap:14px;padding:24px}
+.category-delete-dialog .account-edit-heading h2{font-size:21px}
+.category-delete-copy{margin:0;color:#536079;font-size:14px;line-height:1.5}
+.category-delete-dialog label{font-size:13px}
+.category-delete-dialog select{height:44px}
+.category-delete-error{margin:0;font-size:13px}
+.category-delete-error:empty{display:none}
+.category-delete-dialog .account-edit-actions .btn{min-height:44px}
+.category-delete-dialog .account-edit-actions .danger-btn{background:#bd291e;color:#fff}
+.category-delete-dialog .account-edit-actions .danger-btn:hover{background:#a52219}
+.category-delete-dialog .account-edit-actions .btn:disabled{opacity:.55;cursor:not-allowed}
 .verification-page{min-width:0}
 .verification-page .idp-header{margin-bottom:20px}
 .verification-tabs{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 18px}
