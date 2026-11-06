@@ -1668,7 +1668,7 @@ class App {
           </div>
           <button type="button" class="idp-primary-button" id="add-category">+ Add category</button>
         </div>
-        <div class="idp-metrics">
+        <div class="idp-metrics idp-category-metrics">
           <article class="idp-metric"><span class="idp-metric-label">Categories</span><strong>${rows.length}</strong></article>
           <article class="idp-metric"><span class="idp-metric-label">Projects categorised</span><strong>${projectCount.toLocaleString()}</strong></article>
           <article class="idp-most-viewed"><div><strong>${esc(topCategory?.name ?? '—')}</strong><span>${Number(topCategory?.views ?? 0).toLocaleString()} views</span></div><div class="meta">Most viewed</div></article>

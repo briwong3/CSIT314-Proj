@@ -123,6 +123,13 @@ The daily, weekly, and monthly platform report pages currently display sample fi
 - **Login says the app profile is missing:** run the latest designer-dashboard migration block at the bottom of `schema.sql`. It restores missing profiles from signup metadata; restored accounts receive the customer or designer role, while admin/platform roles must be reassigned by an administrator.
 - **The signed-in header appears but the login form stays visible or the first page fails to load:** run the latest schema in the Supabase SQL Editor. Authenticated users need `SELECT` on `public.categories` as well as the `cat_read` row-level security policy. The app now displays the page-load error instead of silently leaving the login form visible.
 - **Permission denied / row-level security error:** verify that the relevant policies in `schema.sql` were applied and that the signed-in account has the intended role.
+- **Platform Manager sees `permission denied for table categories` when creating a category:** the category row-level security policies may be present, but the Supabase `authenticated` role also needs table and serial-sequence privileges. Run this in the Supabase SQL Editor for the project configured in `config.js`. Row-level security remains enabled, so the category policies still limit changes to Platform Managers.
+
+  ```sql
+  grant select, insert, update, delete on public.categories to authenticated;
+  grant usage, select on sequence public.categories_id_seq to authenticated;
+  ```
+
 - **Admin account actions fail:** confirm the `admin-users` function is deployed to the configured project and its `SUPABASE_SERVICE_ROLE_KEY` secret is set.
 - **Email change remains pending:** the user may need to confirm the new address. Profile email is synchronized when Supabase Auth applies the email update.
 - **JavaScript module/CORS error:** serve the app from `http://localhost` or a deployed HTTPS static host; don't open the HTML file directly.

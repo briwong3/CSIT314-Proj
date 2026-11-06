@@ -127,10 +127,11 @@ alter table notifications enable row level security;
 alter table public.feedback enable row level security;
 
 create policy cat_read on categories for select to authenticated using (true);
-grant select on public.categories to authenticated;
 drop policy if exists categories_platform_insert on public.categories;
 create policy categories_platform_insert on public.categories for insert to authenticated
   with check (my_role()='platform');
+grant select, insert, update, delete on public.categories to authenticated;
+grant usage, select on sequence public.categories_id_seq to authenticated;
 drop policy if exists categories_platform_update on public.categories;
 create policy categories_platform_update on public.categories for update to authenticated
   using (my_role()='platform') with check (my_role()='platform');
@@ -657,6 +658,5 @@ where not exists (
 on conflict (id) do nothing;
 
 grant select, update on public.profiles to authenticated;
-grant select on public.categories to authenticated;
 
 notify pgrst, 'reload schema';
