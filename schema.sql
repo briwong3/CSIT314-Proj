@@ -753,4 +753,81 @@ grant execute on function public.platform_category_usage(integer) to authenticat
 revoke all on function public.platform_move_and_delete_category(integer, integer) from public, anon;
 grant execute on function public.platform_move_and_delete_category(integer, integer) to authenticated;
 
+-- Customer favourites and shortlist-count migration.
+create table if not exists public.favorites (
+  user_id uuid not null references public.profiles(id) on delete cascade,
+  project_id integer not null references public.projects(id) on delete cascade,
+  created_at timestamptz not null default now(),
+  primary key (user_id, project_id)
+);
+create index if not exists favorites_project_idx on public.favorites(project_id);
+
+alter table public.favorites enable row level security;
+drop policy if exists favorites_owner_read on public.favorites;
+drop policy if exists favorites_customer_add on public.favorites;
+drop policy if exists favorites_owner_remove on public.favorites;
+drop policy if exists favorites_read_own on public.favorites;
+create policy favorites_read_own on public.favorites
+  for select to authenticated
+  using (
+    user_id = auth.uid()
+    and exists (
+      select 1 from public.profiles p
+      where p.id = auth.uid() and p.role = 'customer' and p.status = 'active'
+    )
+  );
+drop policy if exists favorites_add_own on public.favorites;
+create policy favorites_add_own on public.favorites
+  for insert to authenticated
+  with check (
+    user_id = auth.uid()
+    and exists (
+      select 1 from public.profiles p
+      where p.id = auth.uid() and p.role = 'customer' and p.status = 'active'
+    )
+    and exists (
+      select 1 from public.projects p
+      where p.id = project_id and p.visibility = 'published'
+    )
+  );
+drop policy if exists favorites_remove_own on public.favorites;
+create policy favorites_remove_own on public.favorites
+  for delete to authenticated
+  using (
+    user_id = auth.uid()
+    and exists (
+      select 1 from public.profiles p
+      where p.id = auth.uid() and p.role = 'customer' and p.status = 'active'
+    )
+  );
+revoke all on public.favorites from public, anon;
+grant select, insert, delete on public.favorites to authenticated;
+
+create or replace function public.update_project_shortlist_count()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  if tg_op = 'INSERT' then
+    update public.projects
+    set shortlists = coalesce(shortlists, 0) + 1
+    where id = new.project_id;
+    return new;
+  end if;
+
+  update public.projects
+  set shortlists = greatest(coalesce(shortlists, 0) - 1, 0)
+  where id = old.project_id;
+  return old;
+end;
+$$;
+
+drop trigger if exists favorites_sync_shortlists on public.favorites;
+drop trigger if exists favorites_update_project_shortlists on public.favorites;
+create trigger favorites_update_project_shortlists
+  after insert or delete on public.favorites
+  for each row execute function public.update_project_shortlist_count();
+
 notify pgrst, 'reload schema';

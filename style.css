@@ -185,6 +185,7 @@ main.project-detail-main{max-width:1240px;margin:20px auto;padding:0 24px}
 .results-count{margin:14px 0;color:#687087;font-size:13px}
 .designer-results{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}
 .finder-designer-card,.browse-project-card{overflow:hidden;border:1px solid var(--line);border-radius:12px;background:#fff}
+.browse-project-card{position:relative}
 .designer-cover{position:relative;height:108px;background:#cfe3dd}
 .cover-1{background:#cdd7e2!important}.cover-2{background:#dfe5ca!important}.cover-3{background:#d8d2e6!important}
 .designer-cover>span,.browse-project-cover>span,.project-main-photo>span,.project-photo-thumbnails span{position:absolute;left:10px;bottom:9px;padding:4px 8px;border-radius:99px;background:#fff;color:#536079;font-size:10px}
@@ -209,6 +210,18 @@ main.project-detail-main{max-width:1240px;margin:20px auto;padding:0 24px}
 .browse-project-info h2 a:hover,.browse-project-info h3 a:hover{text-decoration:underline}
 .browse-project-designer{margin:0 0 12px;color:#687087;font-size:12px}
 .browse-project-meta{display:flex;justify-content:space-between;gap:10px;color:#687087;font-size:11px}
+.fav-btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;min-width:36px;min-height:36px;margin-top:12px;padding:7px;border:1px solid #d5d9e2;border-radius:8px;background:#fff;color:#5a6378;cursor:pointer}
+.fav-btn svg{width:18px;height:18px;fill:transparent;stroke:currentColor;stroke-width:1.8}
+.fav-btn.on{border-color:#ad4051;background:#fff5f6;color:#ad4051}
+.fav-btn.on svg{fill:#ad4051}
+.fav-btn:hover{border-color:#ad4051;color:#ad4051}
+.fav-btn:focus-visible{outline:3px solid #829ac7;outline-offset:2px}
+.fav-btn:disabled{opacity:.6;cursor:wait}
+.fav-btn:not(.fav-btn-labelled){position:absolute;top:10px;right:10px;z-index:2;width:36px;height:36px;margin:0;padding:0;border-radius:50%;box-shadow:0 1px 5px #0003}
+.fav-btn:not(.fav-btn-labelled):hover{transform:scale(1.08)}
+.fav-btn-labelled{width:100%;margin:12px 0 0;font:inherit;font-size:13px;font-weight:600}
+.project-summary .fav-btn-labelled{display:flex;margin:10px 0 0}
+.app-toast{position:fixed;z-index:10000;right:20px;bottom:20px;max-width:min(420px,calc(100vw - 40px));padding:12px 16px;border:1px solid #b64253;border-radius:10px;background:#fff5f6;color:#812638;box-shadow:0 8px 26px #18233b26;font-size:13px}
 .project-breadcrumb{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 14px;color:#687087;font-size:12px}
 .project-detail-layout{display:grid;grid-template-columns:minmax(0,1.7fr) minmax(260px,.9fr);gap:18px;align-items:start}
 .project-gallery{min-width:0}

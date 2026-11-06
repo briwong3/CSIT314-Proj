@@ -68,6 +68,33 @@ class AccountController {
     if (data?.error) throw new Error(data.error);
   }
 }
+class FavoritesController {
+  async ids(userId) {
+    return new Set(must(await db.from('favorites').select('project_id').eq('user_id', userId)).map(row => Number(row.project_id)));
+  }
+  async list() {
+    const rows = must(await db.from('favorites')
+      .select('created_at, project:projects!inner(*, categories(name))')
+      .eq('project.visibility', 'published')
+      .order('created_at', { ascending: false }));
+    const projects = rows.map(row => row.project).filter(Boolean);
+    const designerIds = [...new Set(projects.map(project => project.designer_id).filter(Boolean))];
+    if (!designerIds.length) return projects;
+    const profiles = must(await db.from('profiles').select('id,name').in('id', designerIds));
+    const profilesById = new Map(profiles.map(profile => [profile.id, profile]));
+    return projects.map(project => ({
+      ...project,
+      profiles: profilesById.get(project.designer_id) ?? null
+    }));
+  }
+  async add(projectId, userId) {
+    const { error } = await db.from('favorites').insert({ project_id: projectId, user_id: userId });
+    if (error && error.code !== '23505') throw error;
+  }
+  async remove(projectId, userId) {
+    must(await db.from('favorites').delete().eq('project_id', projectId).eq('user_id', userId));
+  }
+}
 class FeedbackController {
   async list() {
     return must(await db.from('feedback').select('*').order('created_at', { ascending: false }));
@@ -360,12 +387,20 @@ class DesignerController { // "find a designer": search, filter, sort, details
     }));
   }
   async search({ q, cat, min, max, sort }) {
-    let r = db.from('projects').select('*, categories(name), profiles(id,name)').eq('visibility', 'published');
+    let r = db.from('projects').select('*, categories(name)').eq('visibility', 'published');
     if (q) r = r.ilike('title', `%${q}%`);
     if (cat) r = r.eq('category_id', cat);
     if (min) r = r.gte('budget', min);
     if (max) r = r.lte('budget', max);
-    return must(await r.order(sort === 'popular' ? 'views' : 'created_at', { ascending: false }));
+    const projects = must(await r.order(sort === 'popular' ? 'views' : 'created_at', { ascending: false }));
+    const designerIds = [...new Set(projects.map(project => project.designer_id).filter(Boolean))];
+    if (!designerIds.length) return projects;
+    const profiles = must(await db.from('profiles').select('id,name').in('id', designerIds));
+    const profilesById = new Map(profiles.map(profile => [profile.id, profile]));
+    return projects.map(project => ({
+      ...project,
+      profiles: profilesById.get(project.designer_id) ?? null
+    }));
   }
   async findDesigners({ q, cat, sort }) {
     const [profiles, companies, projects] = await Promise.all([
@@ -401,11 +436,13 @@ class DesignerController { // "find a designer": search, filter, sort, details
   }
   async project(id) {
     await db.rpc('increment_views', { pid: id });
-    const p = must(await db.from('projects').select('*, categories(name), profiles(id,name)').eq('id', id).eq('visibility', 'published').single());
-    const [comments, company] = await Promise.all([
+    const p = must(await db.from('projects').select('*, categories(name)').eq('id', id).eq('visibility', 'published').single());
+    const [comments, company, profile] = await Promise.all([
       db.from('comments').select('*').eq('project_id', id).order('created_at'),
-      db.from('companies').select('name').eq('designer_id', p.designer_id).limit(1)
+      db.from('companies').select('name').eq('designer_id', p.designer_id).limit(1),
+      db.from('profiles').select('id,name').eq('id', p.designer_id).single()
     ]);
+    p.profiles = must(profile);
     return { p, comments: must(comments), company: must(company)[0] };
   }
   updateProject(id, designerId, fields) {
@@ -593,8 +630,8 @@ class InboxController {
 // ---------- Boundary ----------
 class App {
   auth = new AuthController(); account = new AccountController();
-  designers = new DesignerController(); feedback = new FeedbackController(); admin = new AdminController(); inbox = new InboxController();
-  user = null; tab = null; activeConversation = null; viewAs = null; previewDesignerId = null;
+  designers = new DesignerController(); favorites = new FavoritesController(); feedback = new FeedbackController(); admin = new AdminController(); inbox = new InboxController();
+  user = null; tab = null; favoriteIds = new Set(); favoritesAvailable = false; activeConversation = null; viewAs = null; previewDesignerId = null;
   $ = s => document.querySelector(s);
   $$ = s => document.querySelectorAll(s);
   labels = { dashboard: 'Dashboard', categories: 'IDP categories', accounts: 'Accounts', profiles: 'User profiles', projects: 'Browse projects', designers: 'Find a designer', favorites: 'Favourites', messages: 'Direct messages', account: 'My account', users: 'Users', logs: 'Audit log', notifications: 'Notifications' };
@@ -649,7 +686,7 @@ class App {
     this.$('#nav').innerHTML = this.user?.role === 'platform'
       ? ''
       : this.user
-        ? tabs.map(t => `<button data-t="${t}" class="${t === this.tab ? 'on' : ''}"${t === 'favorites' ? ' disabled title="Favourites page coming soon"' : ''}>${this.labels[t]}</button>`).join('')
+        ? tabs.map(t => `<button data-t="${t}" class="${t === this.tab ? 'on' : ''}"${t === 'favorites' && this.isReadOnlyPreview ? ' disabled title="Favourites are switched off in preview mode"' : ''}>${this.labels[t]}</button>`).join('')
         : '<a href="#featured">Browse projects</a><a href="#designers">Find a designer</a><span class="nav-coming-soon" aria-disabled="true" title="Favourites page coming soon">Favourites</span>';
     this.$('#nav').onclick = e => e.target.dataset.t && this.open(e.target.dataset.t);
     this.$('#who').innerHTML = this.user
@@ -702,6 +739,7 @@ class App {
   async open(t, ...args) {
     if (this.isReadOnlyPreview && (this.viewAs === 'designer' ? t !== 'dashboard' : !['projects', 'designers'].includes(t))) return;
     if (t === 'messages' && !this.canUseDirectMessages) return;
+    if (t === 'favorites' && (this.user?.role !== 'customer' || this.isReadOnlyPreview)) return;
     if (['categories', 'verification', 'feedback', 'dailyReport', 'weeklyReport', 'monthlyReport'].includes(t) && this.user?.role !== 'platform') return;
     this.tab = t;
     this.shell();
@@ -827,6 +865,113 @@ class App {
   }
   guard(fn) { return async e => { e?.preventDefault?.(); const target = e?.currentTarget; try { await fn(e); } catch (x) { const el = target?.querySelector?.('.err[role="alert"]') || this.$('#msg'); if (el) { el.className = 'err'; el.textContent = x.message; } else throw x; } }; }
   ok(m) { const el = this.$('#msg'); if (el) { el.className = ''; el.textContent = m; } }
+
+  get canFavorite() { return this.user?.role === 'customer' && !this.isReadOnlyPreview; }
+  async loadFavoriteIds() {
+    this.favoritesAvailable = false;
+    this.favoriteIds = this.canFavorite ? await this.favorites.ids(this.user.id) : new Set();
+    this.favoritesAvailable = this.canFavorite;
+  }
+  async prepareFavoriteButtons() {
+    try {
+      await this.loadFavoriteIds();
+    } catch (error) {
+      this.favoriteIds = new Set();
+      this.showToast(`Could not load favourites: ${error.message}`);
+    }
+  }
+  favoriteLabel(saved) { return saved ? 'Remove from favourites' : 'Add to favourites'; }
+  favoriteButton(projectId, labelled = false) {
+    if (!this.canFavorite || !this.favoritesAvailable) return '';
+    const id = Number(projectId);
+    const saved = this.favoriteIds.has(id);
+    const label = this.favoriteLabel(saved);
+    const heart = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20.5s-7.5-4.6-9.6-9.2C.9 7.8 3 4 6.6 4c2 0 3.7 1.1 5.4 3 1.7-1.9 3.4-3 5.4-3 3.6 0 5.7 3.8 4.2 7.3-2.1 4.6-9.6 9.2-9.6 9.2z"/></svg>';
+    return `<button type="button" class="fav-btn${labelled ? ' fav-btn-labelled' : ''}${saved ? ' on' : ''}" data-fav="${id}" aria-pressed="${saved}" aria-label="${label}" title="${label}">${heart}${labelled ? `<span class="fav-text">${label}</span>` : ''}</button>`;
+  }
+  setFavoriteButton(button, saved) {
+    const label = this.favoriteLabel(saved);
+    button.classList.toggle('on', saved);
+    button.setAttribute('aria-pressed', String(saved));
+    button.setAttribute('aria-label', label);
+    button.title = label;
+    const text = button.querySelector('.fav-text');
+    if (text) text.textContent = label;
+  }
+  async toggleFavorite(button) {
+    if (!this.canFavorite || button.disabled) return null;
+    const projectId = Number(button.dataset.fav);
+    if (!Number.isSafeInteger(projectId) || projectId < 1) return null;
+    const saving = button.getAttribute('aria-pressed') !== 'true';
+    button.disabled = true;
+    try {
+      if (saving) await this.favorites.add(projectId, this.user.id);
+      else await this.favorites.remove(projectId, this.user.id);
+      if (saving) this.favoriteIds.add(projectId);
+      else this.favoriteIds.delete(projectId);
+      document.querySelectorAll(`[data-fav="${projectId}"]`).forEach(other => this.setFavoriteButton(other, saving));
+      const counter = this.$(`[data-saved-count="${projectId}"]`);
+      if (counter) {
+        counter.dataset.count = String(Math.max(0, Number(counter.dataset.count ?? 0) + (saving ? 1 : -1)));
+        counter.textContent = Number(counter.dataset.count).toLocaleString();
+      }
+      return saving;
+    } catch (error) {
+      this.showToast(`Could not update favourites: ${error.message}`);
+      return null;
+    } finally {
+      button.disabled = false;
+    }
+  }
+  showToast(text) {
+    document.querySelector('.app-toast')?.remove();
+    const toast = document.createElement('div');
+    toast.className = 'app-toast';
+    toast.setAttribute('role', 'alert');
+    toast.textContent = text;
+    document.body.append(toast);
+    setTimeout(() => toast.remove(), 9000);
+  }
+  async favoritesView() {
+    this.show(`<section class="project-browser"><h1>Favourites</h1><p class="finder-intro">Projects you have saved. Open one to see its details, or remove it from your list.</p>
+      <p class="results-count" id="count"></p><div id="res" class="project-browser-grid"></div><p id="msg" class="err" role="alert"></p></section>`);
+    const result = await Promise.allSettled([this.loadFavoriteIds(), this.favorites.list()]);
+    const failed = result.find(item => item.status === 'rejected');
+    if (failed) {
+      this.$('#msg').textContent = `Could not load favourites: ${failed.reason.message}`;
+      return;
+    }
+    const projects = result[1].value;
+    const renderCount = () => {
+      const count = this.$('#res').querySelectorAll('.browse-project-card').length;
+      this.$('#count').textContent = count ? `${count} saved ${count === 1 ? 'project' : 'projects'}` : '';
+      if (!count) this.$('#res').innerHTML = '<div class="project-empty-state"><h2>No favourites yet</h2><p>Save projects you like and they will appear here.</p><button class="btn" type="button" id="browse-projects">Browse projects</button></div>';
+    };
+    this.$('#res').innerHTML = projects.map((project, index) => {
+      const cover = `<button type="button" class="browse-project-cover${project.image_url ? '' : ` cover-${index % 4}`}" data-p="${project.id}" aria-label="View ${esc(project.title)} details" ${project.image_url ? `style="background-image:url('${esc(project.image_url)}');background-size:cover;background-position:center"` : ''}><span>${project.image_url ? '' : 'Project photo'}</span></button>`;
+      return `<article class="browse-project-card">${cover}<div class="browse-project-info">
+        <p class="project-tag">${esc(project.categories?.name ?? 'Interior design')}</p>
+        <h2><a href="#" data-p="${project.id}">${esc(project.title)}</a></h2>
+        <p class="browse-project-designer">by <a href="#" data-d="${esc(project.profiles?.id)}">${esc(project.profiles?.name ?? 'Designer')}</a></p>
+        <div class="browse-project-meta"><span>${Number(project.views ?? 0).toLocaleString()} views</span><span>${project.budget == null ? 'Budget on request' : `$${Number(project.budget).toLocaleString()}`}</span></div>
+        ${this.favoriteButton(project.id, true)}
+      </div></article>`;
+    }).join('');
+    renderCount();
+    this.$('#res').onclick = async e => {
+      const button = e.target.closest('[data-fav]');
+      const project = e.target.closest('[data-p]');
+      const designer = e.target.closest('[data-d]');
+      if (button) {
+        if (await this.toggleFavorite(button) === false) {
+          button.closest('.browse-project-card')?.remove();
+          renderCount();
+        }
+      } else if (e.target.closest('#browse-projects')) this.open('projects');
+      else if (project) { e.preventDefault(); this.projectView(project.dataset.p, 'favorites'); }
+      else if (designer) { e.preventDefault(); this.designerView(designer.dataset.d); }
+    };
+  }
 
   homeView() {
     this.show(`<div class="homepage">
@@ -1095,6 +1240,7 @@ class App {
 
   async projectsView() {
     const cats = await this.designers.categories();
+    await this.prepareFavoriteButtons();
     const createProjectButton = this.user?.role === 'designer'
       ? `<button class="btn secondary-btn" id="new-project" type="button">Create project</button>`
       : '';
@@ -1135,6 +1281,7 @@ class App {
         <div class="browse-project-info"><p class="project-tag">${esc(project.categories?.name ?? 'Interior design')}</p><h2><a href="#" data-p="${project.id}">${esc(project.title)}</a></h2>
           <p class="browse-project-designer">by <a href="#" data-d="${project.profiles?.id}">${esc(project.profiles?.name ?? 'Designer')}</a></p>
           <div class="browse-project-meta"><span>${Number(project.views ?? 0).toLocaleString()} views</span><span>${project.budget == null ? 'Budget on request' : `$${Number(project.budget).toLocaleString()}`}</span></div>
+          ${this.favoriteButton(project.id)}
         </div></article>`;
       }).join('') || `<div class="project-empty-state"><h2>No projects match your search</h2><p>${this.$('#q').value || this.$('#cat').value || budget ? 'Try removing a filter or searching a different keyword.' : 'There are no projects to display yet.'}</p>${this.$('#q').value || this.$('#cat').value || budget ? '<button class="btn" type="button" id="clear-project-filters">Clear filters</button>' : ''}</div>`;
     });
@@ -1174,7 +1321,9 @@ class App {
       }
       const project = e.target.closest('[data-p]');
       const designer = e.target.closest('[data-d]');
-      if (project) { e.preventDefault(); this.projectView(project.dataset.p, 'projects'); }
+      const favorite = e.target.closest('[data-fav]');
+      if (favorite) this.toggleFavorite(favorite);
+      else if (project) { e.preventDefault(); this.projectView(project.dataset.p, 'projects'); }
       else if (designer) { e.preventDefault(); this.designerView(designer.dataset.d); }
     };
     run();
@@ -1209,6 +1358,7 @@ class App {
   }
   async projectView(id, backView = 'projects', backId = null) {
     const { p, comments, company } = await this.designers.project(id);
+    await this.prepareFavoriteButtons();
     const designerName = p.profiles?.name ?? 'Interior designer';
     const companyName = company?.name ?? designerName;
     const projectCover = p.image_url
@@ -1223,7 +1373,8 @@ class App {
           <dl><div><dt>Budget</dt><dd>${p.budget == null ? 'On request' : `$${Number(p.budget).toLocaleString()}`}</dd></div>
             <div><dt>Completed</dt><dd>${p.created_at ? new Date(p.created_at).toLocaleDateString(undefined, { month: 'long', year: 'numeric' }) : '—'}</dd></div>
             <div><dt>Views</dt><dd>${Number(p.views ?? 0).toLocaleString()}</dd></div>
-            <div><dt>Saved by</dt><dd>${Number(p.shortlists ?? 0).toLocaleString()} customers</dd></div></dl>
+            <div><dt>Saved by</dt><dd><span data-saved-count="${p.id}" data-count="${Number(p.shortlists ?? 0)}">${Number(p.shortlists ?? 0).toLocaleString()}</span> customers</dd></div></dl>
+          ${this.favoriteButton(p.id, true)}
           ${this.user.role === 'customer' ? `<button class="btn project-message" id="message-designer" type="button">Contact designer</button>` : ''}
         </aside></div>
       <section class="project-about"><h2>About this project</h2><p>${esc(p.description || 'The designer has not added a project description yet.')}</p></section>
@@ -1235,6 +1386,7 @@ class App {
     this.$('#back').onclick = e => { e.preventDefault(); this.open(backView, ...(backId === null ? [] : [backId])); };
     this.$('#d').onclick = e => { e.preventDefault(); this.designerView(p.profiles.id); };
     this.$('#project-category').onclick = e => { e.preventDefault(); this.open('projects'); };
+    this.$('[data-fav]')?.addEventListener('click', e => this.toggleFavorite(e.currentTarget));
     this.$('#message-designer')?.addEventListener('click', () => this.startConversation(p.profiles.id, p.id));
     this.$('#comment-form')?.addEventListener('submit', this.guard(async () => {
       const body = this.$('#comment-body').value.trim();
@@ -1252,6 +1404,7 @@ class App {
   }
   async designerView(id) {
     const { profile, company, projects: allProjects } = await this.designers.designer(id);
+    await this.prepareFavoriteButtons();
     const projects = allProjects.filter(project => project.visibility !== 'draft');
     const specialties = [...new Set(projects.map(project => project.categories?.name).filter(Boolean))];
     const totalViews = projects.reduce((total, project) => total + Number(project.views ?? 0), 0);
@@ -1284,7 +1437,7 @@ class App {
         </aside>
         <div class="designer-portfolio">
           <div class="designer-portfolio-heading"><div><h2>Projects by ${esc(companyName)}</h2><p>${projects.length} ${projects.length === 1 ? 'project' : 'projects'} · ${totalViews.toLocaleString()} total views</p></div></div>
-          <div class="project-browser-grid">${projects.map((p, index) => `<article class="browse-project-card"><button type="button" class="browse-project-cover cover-${index % 4}" data-p="${p.id}" aria-label="View ${esc(p.title)} details" ${p.image_url ? `style="background-image:url('${esc(p.image_url)}');background-size:cover;background-position:center"` : ''}><span>${p.image_url ? '' : 'Photo placeholder'}</span></button><div class="browse-project-info"><p class="project-tag">${esc(p.categories?.name ?? 'Interior design')}</p><h3><a href="#" data-p="${p.id}">${esc(p.title)}</a></h3><div class="browse-project-meta"><span>${Number(p.views ?? 0).toLocaleString()} views</span><span>${p.budget == null ? 'Budget on request' : `$${Number(p.budget).toLocaleString()}`}</span></div></div></article>`).join('') || '<p class="empty-state">This designer has not published any projects yet.</p>'}</div>
+          <div class="project-browser-grid">${projects.map((p, index) => `<article class="browse-project-card"><button type="button" class="browse-project-cover cover-${index % 4}" data-p="${p.id}" aria-label="View ${esc(p.title)} details" ${p.image_url ? `style="background-image:url('${esc(p.image_url)}');background-size:cover;background-position:center"` : ''}><span>${p.image_url ? '' : 'Photo placeholder'}</span></button><div class="browse-project-info"><p class="project-tag">${esc(p.categories?.name ?? 'Interior design')}</p><h3><a href="#" data-p="${p.id}">${esc(p.title)}</a></h3><div class="browse-project-meta"><span>${Number(p.views ?? 0).toLocaleString()} views</span><span>${p.budget == null ? 'Budget on request' : `$${Number(p.budget).toLocaleString()}`}</span></div>${this.favoriteButton(p.id)}</div></article>`).join('') || '<p class="empty-state">This designer has not published any projects yet.</p>'}</div>
         </div>
       </div>
       <section class="designer-profile-section designer-services-section">
@@ -1377,8 +1530,10 @@ class App {
       await this.open('messages', conversationId);
     }));
     this.$('#main').onclick = e => {
+      const favorite = e.target.closest('[data-fav]');
       const project = e.target.closest('[data-p]');
-      if (project) { e.preventDefault(); this.projectView(project.dataset.p, 'designer', profile.id); }
+      if (favorite) this.toggleFavorite(favorite);
+      else if (project) { e.preventDefault(); this.projectView(project.dataset.p, 'designer', profile.id); }
     };
   }
 
@@ -1621,7 +1776,11 @@ class App {
       } catch (error) {
         if (request !== deleteRequest) return;
         this.$('#category-delete-copy').textContent = 'Category usage could not be checked. Try again.';
-        this.$('.category-delete-error').textContent = error.message;
+        const missingFunction = error.code === 'PGRST202' ||
+          error.message.includes('platform_category_usage');
+        this.$('.category-delete-error').textContent = missingFunction
+          ? 'Apply the Platform category reassignment and safe-delete migration in schema.sql to the Supabase project configured in config.js, then refresh the API schema cache.'
+          : error.message;
       }
     };
     this.$('#add-category').onclick = () => openDialog(null);
