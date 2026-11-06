@@ -79,6 +79,184 @@ class FeedbackController {
     }).eq('id', id).then(must);
   }
 }
+class ProjectCategory {
+  async categoryExists(name) {
+    const { data, error } = await db
+      .from('categories')
+      .select('name');
+    if (error) throw error;
+    return data.some(category => category.name.toLowerCase() === name.toLowerCase()
+    );
+  }
+  async saveCategory(name) {
+    const { error } = await db
+      .from('categories')
+      .insert({ name: name });
+    if (error) {
+      if (error.code === '23505') {
+        throw new Error('Category already exists');
+      }
+      throw error;
+    }
+    return true;
+  }
+  async validateCategory(categoryID) {
+    const { data, error } = await db
+      .from('categories')
+      .select('id')
+      .eq('id', categoryID)
+      .maybeSingle();
+    if (error) throw error;
+    return data !== null;
+  }
+  async isCategoryUsed(categoryID) {
+    const { data: projects, error: projectError } = await db
+      .from('projects')
+      .select('id')
+      .eq('category_id', categoryID)
+      .limit(1);
+    if (projectError) throw projectError;
+    if (projects.length > 0) return true;
+    const { data: drafts, error: draftError } = await db
+      .from('project_drafts')
+      .select('id')
+      .eq('category_id', categoryID)
+      .limit(1);
+    if (draftError) throw draftError;
+    return drafts.length > 0;
+  }
+  async removeCategory(categoryID) {
+    const { error } = await db
+      .from('categories')
+      .delete()
+      .eq('id', categoryID);
+    if (error) throw error;
+    return true;
+  }
+}
+class CreateCategoryController {
+  constructor() {
+    this.projectCategory = new ProjectCategory();
+  }
+  validateInput(name) {
+    return name.trim().length > 0;
+  }
+  async createCategory(name) {
+    name = name.trim();
+    if (!this.validateInput(name)) {
+      throw new Error('Category name is empty');
+    }
+    if (await this.projectCategory.categoryExists(name)) {
+      throw new Error('Category already exists');
+    }
+    return await this.projectCategory.saveCategory(name);
+  }
+}
+class DeleteCategoryController {
+  constructor() {
+    this.projectCategory = new ProjectCategory();
+  }
+  async validateCategory(categoryID) {
+    return await this.projectCategory.validateCategory(categoryID);
+  }
+  async deleteCategory(categoryID) {
+    const exists = await this.validateCategory(categoryID);
+    if (!exists) {
+      throw new Error('Category not found');
+    }
+    const used = await this.projectCategory.isCategoryUsed(categoryID);
+    if (used) {
+      throw new Error('Category currently in use');
+    }
+    return await this.projectCategory.removeCategory(categoryID);
+  }
+}
+class DeleteCategoryUI {
+  constructor(app) {
+    this.app = app;
+    this.controller = new DeleteCategoryController();
+    this.selectedCategoryID = null;
+  }
+  displayCategories() {
+    return this.app.categoriesView();
+  }
+  selectDeleteCategory(categoryID) {
+    this.selectedCategoryID = categoryID;
+  }
+  selectDeleteOption(categoryID) {
+    this.selectDeleteCategory(categoryID);
+    this.requestConfirmation();
+  }
+  requestConfirmation() {
+    const confirmed = window.confirm(
+      'Are you sure you want to delete this category?'
+    );
+    if (confirmed) {
+      this.confirmDeletion(this.selectedCategoryID);
+    } else {
+      this.cancelDeletion();
+    }
+  }
+  async confirmDeletion(categoryID) {
+    try {
+      await this.controller.deleteCategory(categoryID);
+      await this.displayCategories();
+      this.displayMessage('Category deleted');
+      return true;
+    } catch (error) {
+      this.displayError(error.message);
+      return false;
+    }
+  }
+  cancelDeletion() {
+    this.returnToCategoryManagement();
+  }
+  returnToCategoryManagement() {
+  }
+  displayMessage(message) {
+    window.alert(message);
+  }
+  displayError(message) {
+    window.alert(message);
+  }
+}
+class CreateCategoryUI {
+  constructor(dialog, form, openDialog, refreshCategories) {
+    this.dialog = dialog;
+    this.form = form;
+    this.openDialog = openDialog;
+    this.refreshCategories = refreshCategories;
+    this.controller = new CreateCategoryController();
+  }
+  displayCategories() {
+    return this.refreshCategories();
+  }
+  selectCreateCategory() {
+    this.displayCreateForm();
+  }
+  displayCreateForm() {
+    this.openDialog(null);
+  }
+  async submitCategory(name) {
+    try {
+      await this.controller.createCategory(name);
+      this.dialog.close();
+      await this.displayCategories();
+      this.displayMessage('Category created');
+    } catch (error) {
+      this.displayError(error.message);
+    }
+  }
+  displayMessage(message) {
+    window.alert(message);
+  }
+  displayError(message) {
+    const errorBox = this.form.querySelector(
+      '.category-modal-error'
+    );
+    errorBox.textContent = message;
+  }
+}
 class DesignerController { // "find a designer": search, filter, sort, details
   async categories() { return must(await db.from('categories').select('*').order('name')); }
   async categoryStats() {
@@ -1499,7 +1677,7 @@ class App {
           <h2>All categories</h2>
           <table class="idp-table">
             <thead><tr><th>Name</th><th>Description</th><th>Projects</th><th>Views (all time)</th><th style="width:180px;">Actions</th></tr></thead>
-            <tbody>${rows.map(row => `<tr><td>${esc(row.name)}</td><td>${esc(row.description ?? '') || '—'}</td><td>${row.projects}</td><td>${Number(row.views).toLocaleString()}</td><td><div class="idp-actions"><button type="button" class="idp-action-btn" data-edit-category="${row.id}">Edit</button><button type="button" class="idp-action-btn danger">Delete</button></div></td></tr>`).join('') || '<tr><td colspan="5">No categories yet.</td></tr>'}</tbody>
+            <tbody>${rows.map(row => `<tr><td>${esc(row.name)}</td><td>${esc(row.description ?? '') || '—'}</td><td>${row.projects}</td><td>${Number(row.views).toLocaleString()}</td><td><div class="idp-actions"><button type="button" class="idp-action-btn" data-edit-category="${row.id}">Edit</button><button type="button" class="idp-action-btn danger" data-delete-category="${row.id}"> Delete</button></div></td></tr>`).join('') || '<tr><td colspan="5">No categories yet.</td></tr>'}</tbody>
           </table>
         </section>
       </div>
@@ -1510,7 +1688,7 @@ class App {
             <button type="button" class="account-modal-close" id="close-category-dialog" aria-label="Close dialog">×</button>
           </div>
           <input type="hidden" name="id">
-          <label>Category name<input name="name" maxlength="80" required></label>
+          <label>Category name<input name="name" maxlength="80"></label>
           <label>Description (optional)<textarea name="description" rows="3" maxlength="500"></textarea></label>
           <p class="category-modal-note" id="category-modal-note"></p>
           <p class="err category-modal-error" role="alert"></p>
@@ -1522,6 +1700,7 @@ class App {
       </dialog>
     </section>`);
     this.bindPlatformNavigation();
+    const deleteCategoryUI = new DeleteCategoryUI(this);
     const dialog = this.$('#category-dialog');
     const form = this.$('#category-form');
     const openDialog = category => {
@@ -1529,35 +1708,54 @@ class App {
       form.elements.namedItem('id').value = category?.id ?? '';
       form.elements.namedItem('name').value = category?.name ?? '';
       form.elements.namedItem('description').value = category?.description ?? '';
-      this.$('#category-dialog-title').textContent = category ? 'Edit category' : 'Add category';
-      this.$('#save-category').textContent = category ? 'Save changes' : 'Add category';
+      this.$('#category-dialog-title').textContent = category ? 'Edit category' : 'Create Category';
+      this.$('#save-category').textContent = category ? 'Save changes' : 'Create';
       this.$('#category-modal-note').textContent = category
         ? `Renaming updates this category on all ${category.projects} projects.`
         : 'This category will be available when customers search for projects.';
       dialog.showModal();
       form.elements.namedItem('name').focus();
     };
-    this.$('#add-category').onclick = () => openDialog(null);
+    const createCategoryUI = new CreateCategoryUI(dialog, form, openDialog, () => this.categoriesView());
+    this.$('#add-category').onclick = () => {createCategoryUI.selectCreateCategory();};
     this.$('#close-category-dialog').onclick = () => dialog.close();
     this.$('#cancel-category-dialog').onclick = () => dialog.close();
     this.$('.idp-table').onclick = e => {
       const edit = e.target.closest('[data-edit-category]');
-      if (edit) openDialog(rows.find(row => String(row.id) === edit.dataset.editCategory));
+      if (edit) {
+        openDialog(rows.find(row =>
+          String(row.id) === edit.dataset.editCategory
+        ));
+        return;
+      }
+      const deleteButton = e.target.closest(
+        '[data-delete-category]'
+      );
+      if (deleteButton) {
+        const categoryID = Number(
+          deleteButton.dataset.deleteCategory
+        );
+        deleteCategoryUI.selectDeleteOption(categoryID);
+      }
     };
     dialog.onclick = e => {
       if (e.target === dialog) dialog.close();
     };
     form.onsubmit = this.guard(async () => {
-      const id = form.elements.namedItem('id').value;
-      const fields = {
-        name: form.elements.namedItem('name').value.trim(),
-        description: form.elements.namedItem('description').value.trim() || null
-      };
-      if (!fields.name) throw new Error('Enter a category name.');
-      if (id) await this.designers.updateCategory(id, fields);
-      else await this.designers.createCategory(fields);
-      dialog.close();
-      await this.categoriesView();
+      const categoryID = form.elements.namedItem('id').value;
+      const name = form.elements.namedItem('name').value;
+      if (categoryID) {
+        const fields = {
+          name: name.trim(),
+          description:
+            form.elements.namedItem('description').value.trim() || null
+        };
+        await this.designers.updateCategory(categoryID, fields);
+        dialog.close();
+        await this.categoriesView();
+      } else {
+        await createCategoryUI.submitCategory(name);
+      }
     });
   }
 
