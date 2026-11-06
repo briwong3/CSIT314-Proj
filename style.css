@@ -495,6 +495,7 @@ main.project-detail-main{max-width:1240px;margin:20px auto;padding:0 24px}
 .idp-header p{margin:0;color:#666e7d;font-size:16px}
 .idp-primary-button{border:1px solid #2c3d55;background:#2E3C4F;color:#fff;border-radius:10px;padding:12px 20px;font:inherit;font-weight:700;cursor:pointer;box-shadow:0 6px 12px rgba(46,60,79,.12)}
 .idp-metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px;margin-bottom:22px}
+.idp-category-metrics{grid-template-columns:repeat(3,minmax(0,1fr))}
 .idp-metric{background:#f7f7f9;border:1px solid #dfe3eb;border-radius:12px;padding:18px 16px;min-height:110px;display:flex;flex-direction:column;justify-content:center}
 .idp-metric-label{display:block;color:#677184;font-size:13px;margin-bottom:6px}
 .idp-metric strong{display:block;font-size:40px;line-height:1;color:#202735;letter-spacing:-.06em}
