@@ -525,7 +525,23 @@ class AdminController {
     return { rows: must(result), total: result.count ?? 0 };
   }
   update(id, fields) { return db.from('profiles').update(fields).eq('id', id).then(must); }
-  async #fn(body) { const { data, error } = await db.functions.invoke('admin-users', { body }); if (error) throw error; if (data?.error) throw new Error(data.error); }
+  async #fn(body) {
+    const { data, error } = await db.functions.invoke('admin-users', { body });
+    if (error) {
+      let responseMessage = '';
+      if (typeof error.context?.clone === 'function') {
+        try {
+          const response = await error.context.clone().json();
+          if (typeof response?.error === 'string') responseMessage = response.error;
+        } catch {
+          // Keep the original Functions error when the response is not JSON.
+        }
+      }
+      if (responseMessage) throw new Error(responseMessage);
+      throw error;
+    }
+    if (data?.error) throw new Error(data.error);
+  }
   create(f) { return this.#fn({ action: 'create', ...f }); }
   editAccount(id, fields) { return this.#fn({ action: 'edit', id, ...fields }); }
   setAccountStatus(id, status, reason = '') { return this.#fn({ action: 'status', id, status, reason }); }
@@ -901,6 +917,7 @@ class App {
     this.$('#main').classList.toggle('auth-main', Boolean(this.$('#main').querySelector('.auth-page')));
     this.$('#main').classList.toggle('messages-main', Boolean(this.$('#main').querySelector('.messages-page')));
     this.$('#main').classList.toggle('project-detail-main', Boolean(this.$('#main').querySelector('.project-detail')));
+    this.$('#main').classList.toggle('designer-profile-main', Boolean(this.$('#main').querySelector('.designer-profile')));
     this.$('#main').classList.toggle('designer-main', Boolean(this.$('#main').querySelector('.designer-dashboard')));
   }
   stopAnalyticsSubscription() {
@@ -3617,7 +3634,7 @@ class App {
     }
   }
   async accountsView() {
-    const pageSize = 5;
+    const pageSize = 10;
     let page = 0;
     const profileLabels = { customer: 'Customer', designer: 'Interior Designer', platform: 'Platform Management', admin: 'User Admin' };
     this.show(`<section class="admin-content accounts-page">
@@ -3695,7 +3712,7 @@ class App {
         <td><strong>${esc(user.name)}</strong></td><td>${esc(user.email || '—')}</td><td>${profileLabels[user.role] ?? esc(user.role)}</td>
         <td><span class="account-status ${user.status === 'suspended' ? 'suspended' : 'active'}">${user.status === 'suspended' ? 'Suspended' : 'Active'}</span></td>
         <td><div class="account-row-actions"><button class="btn secondary-btn" data-a="edit" data-id="${user.id}" data-n="${esc(user.name)}" data-email="${esc(user.email)}" data-role="${esc(user.role)}" data-s="${esc(user.status)}">Edit</button>
-          <button class="btn secondary-btn" data-a="sus" data-id="${user.id}" data-s="${user.status}">${user.status === 'active' ? 'Suspend' : 'Reactivate'}</button>
+          <button class="btn secondary-btn" data-a="sus" data-id="${user.id}" data-n="${esc(user.name)}" data-s="${user.status}">${user.status === 'active' ? 'Suspend' : 'Reactivate'}</button>
           <button class="btn secondary-btn" data-a="del" data-id="${user.id}" data-n="${esc(user.name)}">Delete</button></div></td></tr>`).join('') || '<tr><td colspan="5" class="accounts-empty">No accounts match your filters.</td></tr>';
       const start = total ? page * pageSize + 1 : 0;
       const end = Math.min((page + 1) * pageSize, total);

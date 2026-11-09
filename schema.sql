@@ -866,3 +866,18 @@ grant select, insert on public.comments to authenticated;
 grant usage, select on sequence public.comments_id_seq to authenticated;
 
 notify pgrst, 'reload schema';
+
+-- User Admin audit-log access migration.
+alter table public.audit_logs enable row level security;
+grant select on public.audit_logs to authenticated;
+drop policy if exists log_admin on public.audit_logs;
+create policy log_admin on public.audit_logs
+  for select to authenticated using (public.my_role() = 'admin');
+
+-- The admin-users Edge Function runs with SUPABASE_SERVICE_ROLE_KEY.
+grant select on public.profiles to service_role;
+grant update (name, email, role, status) on public.profiles to service_role;
+grant insert (actor, action, detail) on public.audit_logs to service_role;
+grant usage, select on sequence public.audit_logs_id_seq to service_role;
+
+notify pgrst, 'reload schema';

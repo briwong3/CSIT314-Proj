@@ -12,10 +12,14 @@ class AdminService {
 
   async assertAdmin(req: Request): Promise<string> {
     const token = (req.headers.get('Authorization') ?? '').replace('Bearer ', '');
-    const { data: { user } } = await this.db.auth.getUser(token);
+    const { data: { user }, error: authError } = await this.db.auth.getUser(token);
+    if (authError) throw new Error(`Could not verify sign-in: ${authError.message}`);
     if (!user) throw new Error('Not signed in');
-    const { data: p } = await this.db.from('profiles').select('role,status').eq('id', user.id).single();
-    if (p?.role !== 'admin' || p.status !== 'active') throw new Error('Forbidden');
+    const { data: p, error: profileError } = await this.db.from('profiles')
+      .select('role,status').eq('id', user.id).single();
+    if (profileError) throw new Error(`Could not verify the User Admin profile: ${profileError.message}`);
+    if (p.role !== 'admin') throw new Error('This account does not have the User Admin role.');
+    if (p.status !== 'active') throw new Error('This User Admin account is not active.');
     return user.id;
   }
   async deleteSelf(req: Request): Promise<void> {
