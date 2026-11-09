@@ -76,32 +76,8 @@ class AccountController {
     if (data?.error) throw new Error(data.error);
   }
 }
-class FavoritesController {
-  async ids(userId) {
-    return new Set(must(await db.from('favorites').select('project_id').eq('user_id', userId)).map(row => Number(row.project_id)));
-  }
-  async list() {
-    const rows = must(await db.from('favorites')
-      .select('created_at, project:projects!inner(*, categories(name))')
-      .eq('project.visibility', 'published')
-      .order('created_at', { ascending: false }));
-    const projects = rows.map(row => row.project).filter(Boolean);
-    const designerIds = [...new Set(projects.map(project => project.designer_id).filter(Boolean))];
-    if (!designerIds.length) return projects;
-    const profiles = must(await db.from('profiles').select('id,name').in('id', designerIds));
-    const profilesById = new Map(profiles.map(profile => [profile.id, profile]));
-    return projects.map(project => ({
-      ...project,
-      profiles: profilesById.get(project.designer_id) ?? null
-    }));
-  }
-  async add(projectId, userId) {
-    const { error } = await db.from('favorites').insert({ project_id: projectId, user_id: userId });
-    if (error && error.code !== '23505') throw error;
-  }
-  async remove(projectId, userId) {
-    must(await db.from('favorites').delete().eq('project_id', projectId).eq('user_id', userId));
-  }
+class FavoritesController extends globalThis.FavoritesController {
+  constructor() { super(db); }
 }
 class FeedbackController {
   async list() {
@@ -114,221 +90,27 @@ class FeedbackController {
     }).eq('id', id).then(must);
   }
 }
-class DesignerController { // "find a designer": search, filter, sort, details
-  async categories() { return must(await db.from('categories').select('*').order('name')); }
-  async categoryStats() {
-    const [categories, projects] = await Promise.all([
-      loadAllRows(() => db.from('categories').select('*').order('id')),
-      loadAllRows(() => db.from('projects').select('category_id,views').eq('visibility', 'published').order('id'))
-    ]);
-    const stats = new Map();
-    for (const project of projects) {
-      const current = stats.get(project.category_id) ?? { projects: 0, views: 0 };
-      current.projects += 1;
-      current.views += project.views ?? 0;
-      stats.set(project.category_id, current);
-    }
-    return categories.map(category => ({
-      ...category,
-      projects: stats.get(category.id)?.projects ?? 0,
-      views: stats.get(category.id)?.views ?? 0
-    }));
+class DesignerController extends globalThis.CompanyController { // "find a designer": search, filter, sort, details
+  constructor() {
+    super(db);
+    this.categoriesController = new globalThis.CategoryController(db);
+    this.projectsController = new globalThis.ProjectController(db);
+    this.portfolioController = new globalThis.DesignerPortfolioController(db);
   }
-  createCategory(fields) {
-    return db.from('categories').insert(fields).then(must);
-  }
-  updateCategory(id, fields) {
-    return db.from('categories').update(fields).eq('id', id).then(must);
-  }
-  async categoryUsage(id) {
-    return must(await db.rpc('platform_category_usage', { p_category_id: Number(id) }));
-  }
-  async moveAndDeleteCategory(id, targetId) {
-    return must(await db.rpc('platform_move_and_delete_category', {
-      p_category_id: Number(id),
-      p_target_category_id: targetId == null ? null : Number(targetId)
-    }));
-  }
-  async uploadProjectImage(designerId, imageFile) {
-    const safeName = imageFile.name.replace(/[^a-zA-Z0-9._-]/g, '_');
-    const path = `projects/${designerId}/${Date.now()}-${safeName}`;
-    const { error } = await db.storage.from('project-images').upload(path, imageFile, {
-      cacheControl: '3600',
-      upsert: false,
-      contentType: imageFile.type || 'application/octet-stream'
-    });
-    if (error) throw error;
-    return db.storage.from('project-images').getPublicUrl(path).data.publicUrl;
-  }
-  async removeProjectImage(imageUrl) {
-    if (!imageUrl) return null;
-    const marker = '/storage/v1/object/public/project-images/';
-    const index = imageUrl.indexOf(marker);
-    if (index < 0) return null;
-    const path = decodeURIComponent(imageUrl.slice(index + marker.length));
-    const { error } = await db.storage.from('project-images').remove([path]);
-    return error ? `The project image could not be removed: ${error.message}` : null;
-  }
-  async createProject(fields, imageFile = null) {
-    let imageUrl = null;
-    if (imageFile) imageUrl = await this.uploadProjectImage(fields.designer_id, imageFile);
-
-    return must(await db.from('projects').insert({
-      designer_id: fields.designer_id,
-      title: fields.title,
-      description: fields.description || null,
-      category_id: fields.category_id || null,
-      budget: fields.budget === '' || fields.budget == null ? null : Number(fields.budget),
-      stage: fields.stage || 'completed',
-      progress: fields.progress == null ? 100 : Number(fields.progress),
-      visibility: fields.visibility || 'published',
-      image_url: imageUrl
-    }));
-  }
-  async editProject(id, designerId) {
-    const [project, draft] = await Promise.all([
-      db.from('projects').select('*').eq('id', id).eq('designer_id', designerId).single(),
-      db.from('project_drafts').select('*').eq('project_id', id).eq('designer_id', designerId).maybeSingle()
-    ]);
-    const projectRow = must(project);
-    const draftRow = must(draft);
-    return {
-      project: { ...projectRow, ...(draftRow ?? {}) },
-      draft: draftRow
-    };
-  }
+  categories() { return this.categoriesController.categories(); }
+  categoryStats() { return this.categoriesController.categoryStats(); }
+  createCategory(fields) { return this.categoriesController.createCategory(fields); }
+  updateCategory(id, fields) { return this.categoriesController.updateCategory(id, fields); }
+  categoryUsage(id) { return this.categoriesController.categoryUsage(id); }
+  moveAndDeleteCategory(id, targetId) { return this.categoriesController.moveAndDeleteCategory(id, targetId); }
+  uploadProjectImage(designerId, imageFile) { return this.projectsController.uploadProjectImage(designerId, imageFile); }
+  createProject(fields, imageFile = null) { return this.projectsController.createProject(fields, imageFile); }
+  editProject(id, designerId) { return this.projectsController.editProject(id, designerId); }
   saveProjectDraft(projectId, designerId, fields) {
-    return db.from('project_drafts').upsert({
-      project_id: projectId,
-      designer_id: designerId,
-      ...fields,
-      updated_at: new Date().toISOString()
-    }, { onConflict: 'project_id' }).then(must);
+    return this.projectsController.saveProjectDraft(projectId, designerId, fields);
   }
-  async saveProjectChanges(projectId, designerId, fields, imageFile = null) {
-    const project = must(await db.from('projects')
-      .select('image_url')
-      .eq('id', projectId)
-      .eq('designer_id', designerId)
-      .single());
-    const imageUrl = imageFile ? await this.uploadProjectImage(designerId, imageFile) : null;
-    const update = await db.from('projects').update({
-      ...fields,
-      ...(imageUrl ? { image_url: imageUrl } : {})
-    }).eq('id', projectId).eq('designer_id', designerId);
-    if (update.error) {
-      if (imageUrl) {
-        try {
-          const cleanupWarning = await this.removeProjectImage(imageUrl);
-          if (cleanupWarning) throw new Error(cleanupWarning);
-        } catch (cleanupError) {
-          throw new Error(`${update.error.message} The uploaded replacement image could not be cleaned up: ${cleanupError.message}`);
-        }
-      }
-      throw update.error;
-    }
-
-    const draftDelete = await db.from('project_drafts')
-      .delete()
-      .eq('project_id', projectId)
-      .eq('designer_id', designerId);
-    if (draftDelete.error) {
-      throw new Error(`Project changes were saved, but the saved draft could not be cleared: ${draftDelete.error.message}`);
-    }
-
-    if (!imageUrl) return null;
-    try {
-      return await this.removeProjectImage(project.image_url);
-    } catch (error) {
-      return `Project changes were saved, but the previous image could not be removed: ${error.message}`;
-    }
-  }
-  async companyForEdit(designerId) {
-    const [profile, company, categories] = await Promise.all([
-      db.from('profiles').select('id,name').eq('id', designerId).single(),
-      db.from('companies').select('*').eq('designer_id', designerId).limit(1).maybeSingle(),
-      db.from('categories').select('*').order('name')
-    ]);
-    return {
-      profile: must(profile),
-      company: must(company),
-      categories: must(categories)
-    };
-  }
-  async saveCompany(designerId, fields, logoFile = null, coverFile = null) {
-    const existing = must(await db.from('companies')
-      .select('id,logo_url,cover_url')
-      .eq('designer_id', designerId)
-      .limit(1)
-      .maybeSingle());
-    const uploadedUrls = [];
-    let logoUrl;
-    let coverUrl;
-    try {
-      logoUrl = await this.uploadCompanyAsset(designerId, 'logo', logoFile);
-      if (logoUrl) uploadedUrls.push(logoUrl);
-      coverUrl = await this.uploadCompanyAsset(designerId, 'cover', coverFile);
-      if (coverUrl) uploadedUrls.push(coverUrl);
-
-      const values = {
-        ...fields,
-        ...(logoUrl ? { logo_url: logoUrl } : {}),
-        ...(coverUrl ? { cover_url: coverUrl } : {})
-      };
-      if (existing) {
-        must(await db.from('companies')
-          .update(values)
-          .eq('id', existing.id)
-          .eq('designer_id', designerId)
-          .select('id')
-          .single());
-      } else {
-        must(await db.from('companies')
-          .insert({ designer_id: designerId, ...values })
-          .select('id')
-          .single());
-      }
-    } catch (error) {
-      const cleanupWarnings = [];
-      for (const imageUrl of uploadedUrls) {
-        try {
-          const warning = await this.removeProjectImage(imageUrl);
-          if (warning) cleanupWarnings.push(warning);
-        } catch (cleanupError) {
-          cleanupWarnings.push(`An uploaded image could not be cleaned up: ${cleanupError.message}`);
-        }
-      }
-      if (cleanupWarnings.length) {
-        throw new Error(`${error.message} ${cleanupWarnings.join(' ')}`);
-      }
-      throw error;
-    }
-
-    const cleanupWarnings = [];
-    for (const oldUrl of [logoUrl && existing?.logo_url, coverUrl && existing?.cover_url]) {
-      if (!oldUrl) continue;
-      try {
-        const warning = await this.removeProjectImage(oldUrl);
-        if (warning) cleanupWarnings.push(warning);
-      } catch (error) {
-        cleanupWarnings.push(`A replaced image could not be removed: ${error.message}`);
-      }
-    }
-    return cleanupWarnings.length
-      ? `Company information was saved, but an old image could not be removed. ${cleanupWarnings.join(' ')}`
-      : null;
-  }
-  async uploadCompanyAsset(designerId, kind, file) {
-    if (!file) return null;
-    const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, '_');
-    const path = `companies/${designerId}/${kind}-${Date.now()}-${safeName}`;
-    const { error } = await db.storage.from('project-images').upload(path, file, {
-      cacheControl: '3600',
-      upsert: false,
-      contentType: file.type || 'application/octet-stream'
-    });
-    if (error) throw error;
-    return db.storage.from('project-images').getPublicUrl(path).data.publicUrl;
+  saveProjectChanges(projectId, designerId, fields, imageFile = null) {
+    return this.projectsController.saveProjectChanges(projectId, designerId, fields, imageFile);
   }
   async designerActivity(designerId, from) {
     const rows = [];
@@ -493,10 +275,7 @@ class DesignerController { // "find a designer": search, filter, sort, details
     return cleanupWarning ? `Project was deleted. ${cleanupWarning}` : null;
   }
   async designer(id) {
-    const profile = must(await db.from('profiles').select('id,name').eq('id', id).single());
-    const company = (must(await db.from('companies').select('*').eq('designer_id', id)))[0];
-    const projects = must(await db.from('projects').select('*, categories(name)').eq('designer_id', id).order('created_at', { ascending: false }));
-    return { profile, company, projects };
+    return this.portfolioController.designer(id);
   }
   async previewDesigner() {
     const [profiles, projects] = await Promise.all([
