@@ -862,17 +862,17 @@ class App {
           </form>
           <div class="popular-topics"><span>Popular:</span><button type="button" data-topic="Residential">Residential</button><button type="button" data-topic="Commercial">Commercial</button><button type="button" data-topic="Small space">Small space</button><button type="button" data-topic="Luxury">Luxury</button></div>
         </div>
-        <div class="home-gallery" aria-label="Interior design project photo placeholders">
-          <div class="photo-placeholder"><span>Photo placeholder</span></div><div class="photo-placeholder"><span>Photo placeholder</span></div><div class="photo-placeholder"><span>Photo placeholder</span></div>
+        <div class="home-gallery" aria-label="Interior design project photos">
+          <div class="photo-placeholder" role="img" aria-label="Coastal office" style="background-image:url('https://hiunywgantfuigdvmcpk.supabase.co/storage/v1/object/public/homepage/coastaloffice.jpg');background-size:cover;background-position:center"></div><div class="photo-placeholder" role="img" aria-label="Farmhouse room" style="background-image:url('https://hiunywgantfuigdvmcpk.supabase.co/storage/v1/object/public/homepage/farmhouseroom.jpg');background-size:cover;background-position:center"></div><div class="photo-placeholder" role="img" aria-label="Japanese living room" style="background-image:url('https://hiunywgantfuigdvmcpk.supabase.co/storage/v1/object/public/homepage/japandilivingroom.jpg');background-size:cover;background-position:center"></div>
         </div>
       </section>
       <section class="home-section"><div class="home-wrap">
         <h2>Browse by category</h2><p class="section-subtitle">Find projects that match the kind of space you’re renovating.</p>
         <div class="category-grid">
-          <a class="category-card" href="#featured"><div class="photo-placeholder"><span>Photo placeholder</span></div><strong>Residential</strong></a>
-          <a class="category-card" href="#featured"><div class="photo-placeholder"><span>Photo placeholder</span></div><strong>Commercial</strong></a>
-          <a class="category-card" href="#featured"><div class="photo-placeholder"><span>Photo placeholder</span></div><strong>Small space</strong></a>
-          <a class="category-card" href="#featured"><div class="photo-placeholder"><span>Photo placeholder</span></div><strong>Luxury</strong></a>
+          <a class="category-card" href="#featured"><div class="photo-placeholder" role="img" aria-label="Residential interior" style="background-image:url('https://hiunywgantfuigdvmcpk.supabase.co/storage/v1/object/public/homepage/residential.jpg');background-size:cover;background-position:center"></div><strong>Residential</strong></a>
+          <a class="category-card" href="#featured"><div class="photo-placeholder" role="img" aria-label="Commercial interior" style="background-image:url('https://hiunywgantfuigdvmcpk.supabase.co/storage/v1/object/public/homepage/commercial.jpg');background-size:cover;background-position:center"></div><strong>Commercial</strong></a>
+          <a class="category-card" href="#featured"><div class="photo-placeholder" role="img" aria-label="Small space interior" style="background-image:url('https://hiunywgantfuigdvmcpk.supabase.co/storage/v1/object/public/homepage/smallspace.jpg');background-size:cover;background-position:center"></div><strong>Small space</strong></a>
+          <a class="category-card" href="#featured"><div class="photo-placeholder" role="img" aria-label="Luxury interior" style="background-image:url('https://hiunywgantfuigdvmcpk.supabase.co/storage/v1/object/public/homepage/luxury.jpg');background-size:cover;background-position:center"></div><strong>Luxury</strong></a>
         </div>
       </div></section>
       <section class="home-section" id="featured"><div class="home-wrap">
