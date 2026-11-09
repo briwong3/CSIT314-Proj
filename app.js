@@ -4,6 +4,14 @@ import { SUPABASE_URL, SUPABASE_ANON_KEY } from './config.js';
 const db = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const must = ({ data, error }) => { if (error) throw error; return data; };
+const loadAllRows = async createQuery => {
+  const rows = [];
+  for (let offset = 0; ; offset += 1000) {
+    const batch = must(await createQuery().range(offset, offset + 999));
+    rows.push(...batch);
+    if (batch.length < 1000) return rows;
+  }
+};
 
 // ---------- Entity ----------
 class User { constructor(r) { Object.assign(this, r); } get isSuspended() { return this.status === 'suspended'; } }
@@ -97,7 +105,7 @@ class FavoritesController {
 }
 class FeedbackController {
   async list() {
-    return must(await db.from('feedback').select('*').order('created_at', { ascending: false }));
+    return loadAllRows(() => db.from('feedback').select('*').order('created_at', { ascending: false }).order('id'));
   }
   updateStatus(id, status) {
     return db.from('feedback').update({
@@ -110,18 +118,17 @@ class DesignerController { // "find a designer": search, filter, sort, details
   async categories() { return must(await db.from('categories').select('*').order('name')); }
   async categoryStats() {
     const [categories, projects] = await Promise.all([
-      db.from('categories').select('*').order('name'),
-      db.from('projects').select('category_id,views')
+      loadAllRows(() => db.from('categories').select('*').order('id')),
+      loadAllRows(() => db.from('projects').select('category_id,views').eq('visibility', 'published').order('id'))
     ]);
-    const projectRows = must(projects);
     const stats = new Map();
-    for (const project of projectRows) {
+    for (const project of projects) {
       const current = stats.get(project.category_id) ?? { projects: 0, views: 0 };
       current.projects += 1;
       current.views += project.views ?? 0;
       stats.set(project.category_id, current);
     }
-    return must(categories).map(category => ({
+    return categories.map(category => ({
       ...category,
       projects: stats.get(category.id)?.projects ?? 0,
       views: stats.get(category.id)?.views ?? 0
@@ -324,9 +331,27 @@ class DesignerController { // "find a designer": search, filter, sort, details
     return db.storage.from('project-images').getPublicUrl(path).data.publicUrl;
   }
   async designerActivity(designerId, from) {
-    let query = db.from('project_activity').select('project_id,activity_type,created_at').eq('designer_id', designerId);
-    if (from) query = query.gte('created_at', from);
-    return must(await query.order('created_at'));
+    const rows = [];
+    for (let offset = 0; ; offset += 1000) {
+      let query = db.from('project_activity').select('id,project_id,activity_type,created_at').eq('designer_id', designerId);
+      if (from) query = query.gte('created_at', from);
+      const batch = must(await query.order('created_at').order('id').range(offset, offset + 999));
+      rows.push(...batch);
+      if (batch.length < 1000) return rows;
+    }
+  }
+  async platformReportData(from, to) {
+    const [activity, projects, categories, designers, companies] = await Promise.all([
+      loadAllRows(() => db.from('project_activity').select('id,project_id,created_at')
+        .gte('created_at', from).lt('created_at', to).order('created_at').order('id')),
+      loadAllRows(() => db.from('projects').select('id,title,designer_id,category_id,views,shortlists,created_at')
+        .eq('visibility', 'published').order('id')),
+      loadAllRows(() => db.from('categories').select('id,name').order('id')),
+      loadAllRows(() => db.from('profiles').select('id,name,created_at').eq('role', 'designer')
+        .gte('created_at', from).lt('created_at', to).order('created_at').order('id')),
+      loadAllRows(() => db.from('companies').select('designer_id,name').order('id'))
+    ]);
+    return { activity, projects, categories, designers, companies };
   }
   async designerProjectDrafts(designerId) {
     return must(await db.from('project_drafts').select('project_id').eq('designer_id', designerId));
@@ -359,11 +384,12 @@ class DesignerController { // "find a designer": search, filter, sort, details
   }
   async designerVerificationQueue() {
     const [profiles, companies] = await Promise.all([
-      db.from('profiles').select('id,name,email,created_at').eq('role', 'designer').order('created_at', { ascending: false }),
-      db.from('companies').select('designer_id,name,verification_status,rejection_reason')
+      loadAllRows(() => db.from('profiles').select('id,name,email,created_at').eq('role', 'designer')
+        .order('created_at', { ascending: false }).order('id')),
+      loadAllRows(() => db.from('companies').select('designer_id,name,verification_status,rejection_reason').order('designer_id'))
     ]);
-    const companiesByDesigner = new Map(must(companies).map(company => [company.designer_id, company]));
-    return must(profiles).map(profile => {
+    const companiesByDesigner = new Map(companies.map(company => [company.designer_id, company]));
+    return profiles.map(profile => {
       const company = companiesByDesigner.get(profile.id);
       return {
         ...profile,
@@ -435,15 +461,27 @@ class DesignerController { // "find a designer": search, filter, sort, details
     return rows;
   }
   async project(id) {
-    await db.rpc('increment_views', { pid: id });
+    let viewError = null;
+    try {
+      must(await db.rpc('increment_views', { pid: id }));
+    } catch (error) {
+      viewError = error;
+    }
     const p = must(await db.from('projects').select('*, categories(name)').eq('id', id).eq('visibility', 'published').single());
-    const [comments, company, profile] = await Promise.all([
+    const [commentResult, company, profile] = await Promise.all([
       db.from('comments').select('*').eq('project_id', id).order('created_at'),
       db.from('companies').select('name').eq('designer_id', p.designer_id).limit(1),
       db.from('profiles').select('id,name').eq('id', p.designer_id).single()
     ]);
     p.profiles = must(profile);
-    return { p, comments: must(comments), company: must(company)[0] };
+    let comments = [];
+    let commentsError = null;
+    try {
+      comments = must(commentResult);
+    } catch (error) {
+      commentsError = error;
+    }
+    return { p, comments, commentsError, company: must(company)[0], viewError };
   }
   updateProject(id, designerId, fields) {
     return db.from('projects').update(fields).eq('id', id).eq('designer_id', designerId).then(must);
@@ -632,6 +670,7 @@ class App {
   auth = new AuthController(); account = new AccountController();
   designers = new DesignerController(); favorites = new FavoritesController(); feedback = new FeedbackController(); admin = new AdminController(); inbox = new InboxController();
   user = null; tab = null; favoriteIds = new Set(); favoritesAvailable = false; activeConversation = null; viewAs = null; previewDesignerId = null;
+  analyticsChannel = null;
   $ = s => document.querySelector(s);
   $$ = s => document.querySelectorAll(s);
   labels = { dashboard: 'Dashboard', categories: 'IDP categories', accounts: 'Accounts', profiles: 'User profiles', projects: 'Browse projects', designers: 'Find a designer', favorites: 'Favourites', messages: 'Direct messages', account: 'My account', users: 'Users', logs: 'Audit log', notifications: 'Notifications' };
@@ -856,12 +895,52 @@ class App {
     }
   }
   show(html) {
+    this.stopAnalyticsSubscription();
     this.$('#main').innerHTML = html;
     this.$('#main').classList.toggle('home-main', Boolean(this.$('#main').querySelector('.homepage')));
     this.$('#main').classList.toggle('auth-main', Boolean(this.$('#main').querySelector('.auth-page')));
     this.$('#main').classList.toggle('messages-main', Boolean(this.$('#main').querySelector('.messages-page')));
     this.$('#main').classList.toggle('project-detail-main', Boolean(this.$('#main').querySelector('.project-detail')));
     this.$('#main').classList.toggle('designer-main', Boolean(this.$('#main').querySelector('.designer-dashboard')));
+  }
+  stopAnalyticsSubscription() {
+    const channel = this.analyticsChannel;
+    this.analyticsChannel = null;
+    if (channel) db.removeChannel(channel).catch(error => console.error('Could not stop analytics live updates:', error));
+  }
+  subscribeToAnalytics(onChange, designerId = null, tables = ['projects', 'project_activity']) {
+    this.stopAnalyticsSubscription();
+    let refreshTimer = null;
+    const enqueueRefresh = () => {
+      clearTimeout(refreshTimer);
+      refreshTimer = setTimeout(() => {
+        if (this.analyticsChannel === channel) onChange();
+      }, 150);
+    };
+    const channel = db.channel(`view-analytics-${Date.now()}`);
+    for (const table of tables) {
+      const change = {
+        event: '*',
+        schema: 'public',
+        table,
+        ...(designerId && ['projects', 'project_activity'].includes(table)
+          ? { filter: `designer_id=eq.${designerId}` }
+          : {})
+      };
+      channel.on('postgres_changes', change, enqueueRefresh);
+    }
+    this.analyticsChannel = channel;
+    channel.subscribe(status => {
+      if (this.analyticsChannel !== channel) return;
+      const liveStatus = this.$('#analytics-live-status');
+      if (!liveStatus) return;
+      liveStatus.textContent = status === 'SUBSCRIBED'
+        ? 'Live updates connected'
+        : status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED'
+          ? 'Live updates unavailable; refresh to load current data.'
+          : 'Connecting to live updates…';
+      if (status === 'SUBSCRIBED') onChange();
+    });
   }
   guard(fn) { return async e => { e?.preventDefault?.(); const target = e?.currentTarget; try { await fn(e); } catch (x) { const el = target?.querySelector?.('.err[role="alert"]') || this.$('#msg'); if (el) { el.className = 'err'; el.textContent = x.message; } else throw x; } }; }
   ok(m) { const el = this.$('#msg'); if (el) { el.className = ''; el.textContent = m; } }
@@ -958,7 +1037,7 @@ class App {
       </div></article>`;
     }).join('');
     renderCount();
-    this.$('#res').onclick = async e => {
+    this.$('#res').onclick = this.guard(async e => {
       const button = e.target.closest('[data-fav]');
       const project = e.target.closest('[data-p]');
       const designer = e.target.closest('[data-d]');
@@ -968,9 +1047,9 @@ class App {
           renderCount();
         }
       } else if (e.target.closest('#browse-projects')) this.open('projects');
-      else if (project) { e.preventDefault(); this.projectView(project.dataset.p, 'favorites'); }
-      else if (designer) { e.preventDefault(); this.designerView(designer.dataset.d); }
-    };
+      else if (project) await this.projectView(project.dataset.p, 'favorites');
+      else if (designer) await this.designerView(designer.dataset.d);
+    });
   }
 
   homeView() {
@@ -1002,12 +1081,7 @@ class App {
       </div></section>
       <section class="home-section" id="featured"><div class="home-wrap">
         <div class="section-heading"><div><h2>Featured projects</h2><p class="section-subtitle">Recently popular with customers.</p></div><a class="text-link" href="#home-search">View all →</a></div>
-        <div class="project-grid">
-          <article class="project-card"><div class="photo-placeholder"><span>Photo placeholder</span></div><div class="project-info"><p class="project-tag">Residential</p><h3>Scandinavian 4-room flat</h3><p>by Oakline Studio</p><div class="project-meta"><span>1,240 views</span><button class="save-btn" type="button" data-action="save">Save</button></div></div></article>
-          <article class="project-card"><div class="photo-placeholder"><span>Photo placeholder</span></div><div class="project-info"><p class="project-tag">Commercial</p><h3>Industrial loft conversion</h3><p>by Brickhaus Interiors</p><div class="project-meta"><span>760 views</span><button class="save-btn" type="button" data-action="save">Save</button></div></div></article>
-          <article class="project-card"><div class="photo-placeholder"><span>Photo placeholder</span></div><div class="project-info"><p class="project-tag">Residential</p><h3>Japandi landed home</h3><p>by Kin Design</p><div class="project-meta"><span>1,510 views</span><button class="save-btn" type="button" data-action="save">Save</button></div></div></article>
-          <article class="project-card"><div class="photo-placeholder"><span>Photo placeholder</span></div><div class="project-info"><p class="project-tag">Small space</p><h3>Compact studio makeover</h3><p>by Tiny Nest Studio</p><div class="project-meta"><span>640 views</span><button class="save-btn" type="button" data-action="save">Save</button></div></div></article>
-        </div>
+        <p class="section-subtitle">Sign in to browse published projects and see their current view counts.</p>
       </div></section>
       <section class="home-section" id="how"><div class="home-wrap">
         <h2>How it works</h2><p class="section-subtitle">Three simple steps from idea to shortlist.</p>
@@ -1357,7 +1431,7 @@ class App {
     run();
   }
   async projectView(id, backView = 'projects', backId = null) {
-    const { p, comments, company } = await this.designers.project(id);
+    const { p, comments, commentsError, company, viewError } = await this.designers.project(id);
     await this.prepareFavoriteButtons();
     const designerName = p.profiles?.name ?? 'Interior designer';
     const companyName = company?.name ?? designerName;
@@ -1366,6 +1440,7 @@ class App {
       : `<div class="project-main-photo"><span>Main photo placeholder</span></div>`;
     this.show(`<section class="project-detail">
       <nav class="project-breadcrumb" aria-label="Breadcrumb"><a href="#" id="back">Browse projects</a><span aria-hidden="true">/</span><a href="#" id="project-category">${esc(p.categories?.name ?? 'Interior design')}</a><span aria-hidden="true">/</span><span>${esc(p.title)}</span></nav>
+      ${viewError ? `<p class="err" role="alert">This project opened, but its view could not be recorded: ${esc(viewError.message)}</p>` : ''}
       <div class="project-detail-layout"><div class="project-gallery">${projectCover}
         <div class="project-photo-thumbnails"><div class="cover-1"><span>Photo 2</span></div><div class="cover-2"><span>Photo 3</span></div><div class="cover-3"><span>Photo 4</span></div></div></div>
         <aside class="project-summary"><p class="project-tag">${esc(p.categories?.name ?? 'Interior design')}</p><h1>${esc(p.title)}</h1>
@@ -1380,6 +1455,7 @@ class App {
       <section class="project-about"><h2>About this project</h2><p>${esc(p.description || 'The designer has not added a project description yet.')}</p></section>
       ${this.user.role === 'customer' ? `<section class="project-enquiry"><h2>Send an enquiry to ${esc(companyName)}</h2><form id="enquiry-form"><label for="enquiry-message">Your message</label><textarea id="enquiry-message" required maxlength="2000" placeholder="Write here"></textarea><button class="btn" type="submit">Send message</button><p class="muted">Only you and the designer can read this message.</p><p id="enquiry-error" class="err" role="alert"></p></form></section>` : ''}
       <section class="project-comments"><h2>Comments (${comments.length})</h2>
+        ${commentsError ? `<p class="err" role="alert">Comments could not be loaded: ${esc(commentsError.message)}. The project still opened.</p>` : ''}
         ${this.user.role === 'customer' ? `<form id="comment-form"><label for="comment-body">Add a comment</label><textarea id="comment-body" required maxlength="2000" placeholder="Write here"></textarea><button class="btn" type="submit">Post comment</button><p id="comment-error" class="err" role="alert"></p></form>` : '<p class="muted">Sign in as a customer to add a comment.</p>'}
         <div class="comment-list">${comments.map(comment => `<article class="project-comment"><div><strong>${esc(comment.author_name || 'Customer')}</strong><time>${comment.created_at ? new Date(comment.created_at).toLocaleDateString() : ''}</time></div><p>${esc(comment.body)}</p></article>`).join('') || '<p class="empty-state">No comments yet. Be the first to share your thoughts.</p>'}</div>
       </section></section>`);
@@ -1626,7 +1702,7 @@ class App {
   }
 
   async categoriesView() {
-    const rows = await this.designers.categoryStats();
+    let rows = await this.designers.categoryStats();
     const topCategory = [...rows].sort((a, b) => b.views - a.views)[0];
     const projectCount = rows.reduce((total, row) => total + row.projects, 0);
     this.show(`<section class="idp-shell">
@@ -1655,15 +1731,16 @@ class App {
           <button type="button" class="idp-primary-button" id="add-category">+ Add category</button>
         </div>
         <div class="idp-metrics idp-category-metrics">
-          <article class="idp-metric"><span class="idp-metric-label">Categories</span><strong>${rows.length}</strong></article>
-          <article class="idp-metric"><span class="idp-metric-label">Projects categorised</span><strong>${projectCount.toLocaleString()}</strong></article>
-          <article class="idp-most-viewed"><div><strong>${esc(topCategory?.name ?? '—')}</strong><span>${Number(topCategory?.views ?? 0).toLocaleString()} views</span></div><div class="meta">Most viewed</div></article>
+          <article class="idp-metric"><span class="idp-metric-label">Categories</span><strong id="category-count">${rows.length}</strong></article>
+          <article class="idp-metric"><span class="idp-metric-label">Published projects categorised</span><strong id="category-project-count">${projectCount.toLocaleString()}</strong></article>
+          <article class="idp-most-viewed"><div><strong id="category-most-viewed-name">${esc(topCategory?.name ?? '—')}</strong><span id="category-most-viewed-views">${Number(topCategory?.views ?? 0).toLocaleString()} views</span></div><div class="meta">Most viewed</div></article>
         </div>
+        <p id="analytics-live-status" class="idp-note" aria-live="polite">Connecting to live updates…</p>
         <section class="idp-table-card">
           <h2>All categories</h2>
           <table class="idp-table">
             <thead><tr><th>Name</th><th>Description</th><th>Projects</th><th>Views (all time)</th><th style="width:180px;">Actions</th></tr></thead>
-            <tbody>${rows.map(row => `<tr><td>${esc(row.name)}</td><td>${esc(row.description ?? '') || '—'}</td><td>${row.projects}</td><td>${Number(row.views).toLocaleString()}</td><td><div class="idp-actions"><button type="button" class="idp-action-btn" data-edit-category="${row.id}">Edit</button><button type="button" class="idp-action-btn danger" data-delete-category="${row.id}">Delete</button></div></td></tr>`).join('') || '<tr><td colspan="5">No categories yet.</td></tr>'}</tbody>
+            <tbody id="category-rows">${rows.map(row => `<tr><td>${esc(row.name)}</td><td>${esc(row.description ?? '') || '—'}</td><td>${row.projects}</td><td>${Number(row.views).toLocaleString()}</td><td><div class="idp-actions"><button type="button" class="idp-action-btn" data-edit-category="${row.id}">Edit</button><button type="button" class="idp-action-btn danger" data-delete-category="${row.id}">Delete</button></div></td></tr>`).join('') || '<tr><td colspan="5">No categories yet.</td></tr>'}</tbody>
           </table>
           <p class="err category-page-error" role="alert"></p>
         </section>
@@ -1706,6 +1783,27 @@ class App {
       </dialog>
     </section>`);
     this.bindPlatformNavigation();
+    let refreshSequence = 0;
+    const refreshCategories = async () => {
+      const currentSequence = ++refreshSequence;
+      try {
+        const latestRows = await this.designers.categoryStats();
+        if (currentSequence !== refreshSequence || !this.$('#category-rows')) return;
+        rows = latestRows;
+        const latestTopCategory = [...rows].sort((a, b) => b.views - a.views)[0];
+        this.$('#category-count').textContent = rows.length.toLocaleString();
+        this.$('#category-project-count').textContent = rows.reduce((total, row) => total + row.projects, 0).toLocaleString();
+        this.$('#category-most-viewed-name').textContent = latestTopCategory?.name ?? '—';
+        this.$('#category-most-viewed-views').textContent = `${Number(latestTopCategory?.views ?? 0).toLocaleString()} views`;
+        this.$('#category-rows').innerHTML = rows.map(row => `<tr><td>${esc(row.name)}</td><td>${esc(row.description ?? '') || '—'}</td><td>${row.projects}</td><td>${Number(row.views).toLocaleString()}</td><td><div class="idp-actions"><button type="button" class="idp-action-btn" data-edit-category="${row.id}">Edit</button><button type="button" class="idp-action-btn danger" data-delete-category="${row.id}">Delete</button></div></td></tr>`).join('') || '<tr><td colspan="5">No categories yet.</td></tr>';
+        this.$('.category-page-error').textContent = '';
+      } catch (error) {
+        if (currentSequence === refreshSequence && this.$('.category-page-error')) {
+          this.$('.category-page-error').textContent = `Could not refresh categories: ${error.message}`;
+        }
+      }
+    };
+    this.subscribeToAnalytics(refreshCategories, null, ['categories', 'projects']);
     const dialog = this.$('#category-dialog');
     const form = this.$('#category-form');
     const deleteDialog = this.$('#category-delete-dialog');
@@ -1885,10 +1983,11 @@ class App {
           <button type="button" class="verification-tab" data-filter="verified">Verified</button>
           <button type="button" class="verification-tab" data-filter="rejected">Rejected</button>
         </div>
+        <p id="analytics-live-status" class="idp-note" aria-live="polite">Connecting to live updates…</p>
         <p class="err verification-error" id="verification-error" role="alert"></p>
         <div class="verification-table-wrap">
           <table class="verification-table">
-            <thead><tr><th>Company</th><th>Email</th><th>Registered</th><th>Documents</th><th>Status</th><th>Actions</th></tr></thead>
+            <thead><tr><th>Company</th><th>Email</th><th>Registered</th><th>Status</th><th>Actions</th></tr></thead>
             <tbody id="verification-rows"></tbody>
           </table>
         </div>
@@ -1924,11 +2023,10 @@ class App {
           <td><strong>${esc(item.company)}</strong></td>
           <td>${esc(item.email ?? '—')}</td>
           <td>${item.created_at ? new Date(item.created_at).toLocaleDateString() : '—'}</td>
-          <td><button type="button" class="verification-doc-link" data-action="documents" data-id="${esc(item.id)}">View documents</button></td>
           <td><span class="verification-status ${status}">${status[0].toUpperCase() + status.slice(1)}</span></td>
           <td><div class="verification-actions">${actionButtons}</div></td>
         </tr>`;
-      }).join('') || `<tr><td class="verification-empty" colspan="6">No ${activeFilter} designer applications.</td></tr>`;
+      }).join('') || `<tr><td class="verification-empty" colspan="5">No ${activeFilter} designer applications.</td></tr>`;
     };
     const setTabCounts = () => {
       this.$('[data-filter="pending"]').textContent = `Pending (${designers.filter(item => item.verification_status === 'pending').length})`;
@@ -1939,20 +2037,17 @@ class App {
       currentDesigner = designer;
       dialogAction = action;
       const isRejecting = action === 'reject';
-      this.$('#verification-dialog-title').textContent = action === 'documents'
-        ? 'Verification documents'
-        : isRejecting ? 'Reject designer' : 'Designer details';
+      this.$('#verification-dialog-title').textContent = isRejecting ? 'Reject designer' : 'Designer details';
       this.$('#verification-detail').innerHTML = `<dl class="verification-details">
         <div><dt>Company</dt><dd>${esc(designer.company)}</dd></div>
         <div><dt>Designer</dt><dd>${esc(designer.name)}</dd></div>
         <div><dt>Email</dt><dd>${esc(designer.email ?? '—')}</dd></div>
         <div><dt>Registered</dt><dd>${designer.created_at ? new Date(designer.created_at).toLocaleString() : '—'}</dd></div>
         ${designer.rejection_reason ? `<div><dt>Rejection reason</dt><dd>${esc(designer.rejection_reason)}</dd></div>` : ''}
-        ${action === 'documents' ? '<p class="verification-no-documents">No verification documents have been uploaded.</p>' : ''}
       </dl>`;
       this.$('#rejection-reason-field').hidden = !isRejecting;
       this.$('#verification-form').elements.namedItem('reason').value = '';
-      this.$('#verification-submit').hidden = action === 'review' || action === 'documents';
+      this.$('#verification-submit').hidden = action === 'review';
       this.$('#verification-submit').textContent = isRejecting ? 'Reject application' : 'Approve designer';
       this.$('.verification-dialog-error').textContent = '';
       dialog.showModal();
@@ -1988,7 +2083,7 @@ class App {
     };
     this.$('#verification-form').onsubmit = this.guard(async e => {
       e.preventDefault();
-      if (dialogAction === 'review' || dialogAction === 'documents') return;
+      if (dialogAction === 'review') return;
       const reason = this.$('#verification-form').elements.namedItem('reason').value.trim();
       if (dialogAction === 'reject' && !reason) throw new Error('Provide a reason for rejection.');
       const status = dialogAction === 'reject' ? 'rejected' : 'verified';
@@ -2001,6 +2096,23 @@ class App {
     });
     setTabCounts();
     renderRows();
+    let refreshSequence = 0;
+    const refreshVerification = async () => {
+      const currentSequence = ++refreshSequence;
+      try {
+        const latestDesigners = await this.designers.designerVerificationQueue();
+        if (currentSequence !== refreshSequence || !this.$('#verification-rows')) return;
+        designers = latestDesigners;
+        setTabCounts();
+        renderRows();
+        this.$('#verification-error').textContent = '';
+      } catch (error) {
+        if (currentSequence === refreshSequence && this.$('#verification-error')) {
+          this.$('#verification-error').textContent = `Could not refresh designer verification: ${error.message}`;
+        }
+      }
+    };
+    this.subscribeToAnalytics(refreshVerification, null, ['profiles', 'companies']);
   }
 
   bindPlatformNavigation() {
@@ -2060,6 +2172,7 @@ class App {
           <article class="feedback-stat"><span>In review</span><strong id="feedback-review-count"></strong></article>
           <article class="feedback-stat"><span>Resolved</span><strong id="feedback-resolved-count"></strong></article>
         </div>
+        <p id="analytics-live-status" class="report-note" aria-live="polite">Connecting to live updates…</p>
         <section class="feedback-panel">
           <div class="feedback-filters">
             <label>Status<select id="feedback-status"><option value="">All</option><option value="open">Open</option><option value="in_review">In review</option><option value="resolved">Resolved</option></select></label>
@@ -2166,6 +2279,25 @@ class App {
     this.$('#feedback-done').onclick = () => dialog.close();
     dialog.onclick = e => { if (e.target === dialog) dialog.close(); };
     renderRows();
+    let refreshSequence = 0;
+    const refreshFeedback = async () => {
+      const currentSequence = ++refreshSequence;
+      try {
+        const latestRows = await this.feedback.list();
+        if (currentSequence !== refreshSequence || !this.$('#feedback-rows')) return;
+        rows = latestRows;
+        showCount('#feedback-open-count', 'open');
+        showCount('#feedback-review-count', 'in_review');
+        showCount('#feedback-resolved-count', 'resolved');
+        renderRows();
+        this.$('#feedback-error').textContent = '';
+      } catch (error) {
+        if (currentSequence === refreshSequence && this.$('#feedback-error')) {
+          this.$('#feedback-error').textContent = `Could not refresh feedback: ${error.message}`;
+        }
+      }
+    };
+    this.subscribeToAnalytics(refreshFeedback, null, ['feedback']);
   }
 
   dailyReportView() { return this.reportView('daily'); }
@@ -2173,36 +2305,13 @@ class App {
   monthlyReportView() { return this.reportView('monthly'); }
 
   reportView(period) {
-    const reports = {
-      daily: {
-        title: 'Daily report', dateLabel: 'Date', inputType: 'date',
-        metrics: [{ label: 'New IDPs', value: 5, delta: '+1 vs yesterday' }, { label: 'Total views', value: 125, delta: '+8% vs yesterday' }, { label: 'Total shortlists', value: 28, delta: '+3 vs yesterday' }],
-        chartTitle: 'Views by time of day',
-        chart: [{ label: '00–04', value: 8 }, { label: '04–08', value: 5 }, { label: '08–12', value: 22 }, { label: '12–16', value: 38 }, { label: '16–20', value: 31 }, { label: '20–24', value: 21 }],
-        categories: [{ name: 'Residential', views: 58, share: 46, shortlists: 14, newIds: 3 }, { name: 'Commercial', views: 31, share: 25, shortlists: 7, newIds: 1 }, { name: 'Small space', views: 22, share: 18, shortlists: 5, newIds: 1 }, { name: 'Luxury', views: 14, share: 11, shortlists: 2, newIds: 0 }],
-        projects: [{ title: 'Japandi landed home', company: 'Kiln Design', views: 21, shortlists: 5 }, { title: 'Scandinavian 4-room flat', company: 'Oakline Studio', views: 17, shortlists: 4 }, { title: 'Warm minimalist condo', company: 'Mira & Co', views: 12, shortlists: 3 }]
-      },
-      weekly: {
-        title: 'Weekly report', dateLabel: 'Week starting', inputType: 'date',
-        metrics: [{ label: 'New IDPs', value: 67, delta: '+9 vs last week' }, { label: 'Total views', value: 991, delta: '+5% vs last week' }, { label: 'Total shortlists', value: 213, delta: '+12 vs last week' }],
-        chartTitle: 'Views per day',
-        chart: [{ label: 'Mon', value: 120 }, { label: 'Tue', value: 135 }, { label: 'Wed', value: 150 }, { label: 'Thu', value: 140 }, { label: 'Fri', value: 160 }, { label: 'Sat', value: 155 }, { label: 'Sun', value: 131 }],
-        categories: [{ name: 'Residential', views: 412, share: 42, shortlists: 97, newIds: 28 }, { name: 'Commercial', views: 268, share: 27, shortlists: 53, newIds: 14 }, { name: 'Small space', views: 190, share: 19, shortlists: 41, newIds: 19 }, { name: 'Luxury', views: 121, share: 12, shortlists: 22, newIds: 6 }],
-        projects: [{ title: 'Japandi landed home', company: 'Kiln Design', views: 112, shortlists: 26 }, { title: 'Scandinavian 4-room flat', company: 'Oakline Studio', views: 98, shortlists: 22 }, { title: 'Warm minimalist condo', company: 'Mira & Co', views: 85, shortlists: 19 }]
-      },
-      monthly: {
-        title: 'Monthly report', dateLabel: 'Month', inputType: 'month',
-        metrics: [{ label: 'New IDPs', value: 265, delta: '+31 vs last month' }, { label: 'Total views', value: 4280, delta: '+11% vs last month' }, { label: 'Total shortlists', value: 906, delta: '+74 vs last month' }],
-        chartTitle: 'Views per week',
-        chart: [{ label: 'Week 1', value: 980 }, { label: 'Week 2', value: 1090 }, { label: 'Week 3', value: 1150 }, { label: 'Week 4', value: 1060 }],
-        categories: [{ name: 'Residential', views: 1780, share: 42, shortlists: 410, newIds: 112 }, { name: 'Commercial', views: 1150, share: 27, shortlists: 226, newIds: 58 }, { name: 'Small space', views: 820, share: 19, shortlists: 174, newIds: 71 }, { name: 'Luxury', views: 530, share: 12, shortlists: 96, newIds: 24 }],
-        projects: [{ title: 'Japandi landed home', company: 'Kiln Design', views: 480, shortlists: 104 }, { title: 'Scandinavian 4-room flat', company: 'Oakline Studio', views: 410, shortlists: 92 }, { title: 'Warm minimalist condo', company: 'Mira & Co', views: 365, shortlists: 81 }]
-      }
-    };
-    const report = reports[period];
-    const now = new Date();
+    const report = {
+      daily: { title: 'Daily report', dateLabel: 'Date', inputType: 'date', chartTitle: 'Views by time of day' },
+      weekly: { title: 'Weekly report', dateLabel: 'Week starting', inputType: 'date', chartTitle: 'Views per day' },
+      monthly: { title: 'Monthly report', dateLabel: 'Month', inputType: 'month', chartTitle: 'Views by week' }
+    }[period];
     const toDateValue = date => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
-    const initialDate = period === 'monthly' ? toDateValue(now).slice(0, 7) : toDateValue(now);
+    const initialDate = period === 'monthly' ? toDateValue(new Date()).slice(0, 7) : toDateValue(new Date());
     this.show(`<section class="idp-shell">
       <aside class="idp-sidebar">
         <div class="idp-nav-stack">
@@ -2221,37 +2330,105 @@ class App {
       </aside>
       <div class="idp-main report-page">
         <div class="report-heading"><h1>${report.title}</h1><p>Customer interest and new projects across the platform for the selected ${period === 'daily' ? 'day' : period === 'weekly' ? 'week' : 'month'}.</p></div>
-        <div class="report-datebar">
-          <div class="report-date-controls"><label for="report-date">${report.dateLabel}</label>
-            <div class="report-date-inputs"><button type="button" class="report-outline-button" id="report-previous">‹ Previous</button><input id="report-date" type="${report.inputType}" value="${initialDate}"><button type="button" class="report-outline-button" id="report-next">Next ›</button></div>
-          </div>
-          <button type="button" class="report-outline-button" id="report-export">Export CSV</button>
-        </div>
-        <div class="report-stat-grid">${report.metrics.map((metric, i) => `<article class="report-stat"><span>${metric.label}</span><strong>${metric.value.toLocaleString()}</strong><small>${metric.delta}</small></article>`).join('')}</div>
-        <section class="report-panel">
-          <h2>${report.chartTitle}</h2>
-          <div class="report-chart">${report.chart.map(item => `<div class="report-bar-wrap"><strong>${item.value.toLocaleString()}</strong><div class="report-bar" style="height:${Math.max(14, item.value / Math.max(...report.chart.map(point => point.value)) * 118)}px"></div><span>${item.label}</span></div>`).join('')}</div>
-        </section>
-        <section class="report-panel">
-          <h2>By category</h2>
-          <div class="report-table-wrap"><table class="report-table">
-            <thead><tr><th>Category</th><th>Views</th><th>Share of views</th><th>Shortlists</th><th>New IDPs</th></tr></thead>
-            <tbody>${report.categories.map(category => `<tr><td><strong>${category.name}</strong></td><td>${category.views.toLocaleString()}</td><td><div class="report-share"><span><i style="width:${category.share}%"></i></span>${category.share}%</div></td><td>${category.shortlists.toLocaleString()}</td><td>${category.newIds.toLocaleString()}</td></tr>`).join('')}</tbody>
-          </table></div>
-        </section>
-        <section class="report-panel">
-          <h2>Top projects</h2>
-          <div class="report-table-wrap"><table class="report-table">
-            <thead><tr><th>Project</th><th>Company</th><th>Views</th><th>Shortlists</th></tr></thead>
-            <tbody>${report.projects.map(project => `<tr><td><strong>${project.title}</strong></td><td>${project.company}</td><td>${project.views.toLocaleString()}</td><td>${project.shortlists.toLocaleString()}</td></tr>`).join('')}</tbody>
-          </table></div>
-        </section>
-        <p class="report-note">Sample figures. Calculated from project views, favourites and new projects. Change vs ${period === 'daily' ? 'yesterday' : period === 'weekly' ? 'last week' : 'last month'} is shown on each card.</p>
+        <div class="report-datebar"><div class="report-date-controls"><label for="report-date">${report.dateLabel}</label>
+          <div class="report-date-inputs"><button type="button" class="report-outline-button" id="report-previous">‹ Previous</button><input id="report-date" type="${report.inputType}" value="${initialDate}"><button type="button" class="report-outline-button" id="report-next">Next ›</button></div>
+        </div><button type="button" class="report-outline-button" id="report-export">Export CSV</button></div>
+        <p id="report-error" class="err" role="alert"></p>
+        <p id="analytics-live-status" class="report-note" aria-live="polite">Loading current data…</p>
+        <div class="report-stat-grid" id="report-stats"></div>
+        <section class="report-panel"><h2>${report.chartTitle}</h2><div class="report-chart" id="report-chart"></div></section>
+        <section class="report-panel"><h2>By category</h2><div class="report-table-wrap"><table class="report-table">
+          <thead><tr><th>Category</th><th>Views</th><th>Share of views</th><th>Current shortlists</th><th>New projects</th></tr></thead><tbody id="report-categories"></tbody>
+        </table></div></section>
+        <section class="report-panel"><h2>Top projects</h2><div class="report-table-wrap"><table class="report-table">
+          <thead><tr><th>Project</th><th>Company</th><th>Views</th><th>Shortlists</th></tr></thead><tbody id="report-projects"></tbody>
+        </table></div></section>
+        <p class="report-note">Views are counted from recorded project-view events. Event history starts when the view-history migration is applied; older aggregate view totals cannot be assigned to dates. Shortlist counts show favourites currently saved.</p>
       </div>
     </section>`);
     this.bindPlatformNavigation();
-
     const dateInput = this.$('#report-date');
+    let reportData = null;
+    let requestId = 0;
+    const loadReport = async () => {
+      const currentRequest = ++requestId;
+      reportData = null;
+      this.$('#report-error').textContent = '';
+      this.$('#report-stats').innerHTML = '<p>Loading report data…</p>';
+      this.$('#report-chart').innerHTML = '';
+      this.$('#report-categories').innerHTML = '';
+      this.$('#report-projects').innerHTML = '';
+      try {
+        const selectedDate = new Date(period === 'monthly' ? `${dateInput.value}-01T00:00:00` : `${dateInput.value}T00:00:00`);
+        if (Number.isNaN(selectedDate.getTime())) throw new Error('Choose a valid report date.');
+        const start = new Date(selectedDate);
+        const end = new Date(selectedDate);
+        if (period === 'daily') end.setDate(end.getDate() + 1);
+        else if (period === 'weekly') end.setDate(end.getDate() + 7);
+        else end.setMonth(end.getMonth() + 1);
+        const data = await this.designers.platformReportData(start.toISOString(), end.toISOString());
+        if (currentRequest !== requestId || !this.$('#report-chart')) return;
+        reportData = data;
+        const projectsById = new Map(data.projects.map(project => [project.id, project]));
+        const companyNames = new Map(data.companies.map(company => [company.designer_id, company.name]));
+        const viewsByProject = new Map();
+        const viewsByCategory = new Map();
+        const chartValues = Array(period === 'daily' ? 6 : period === 'weekly' ? 7 : 5).fill(0);
+        for (const event of data.activity) {
+          const project = projectsById.get(event.project_id);
+          if (!project) continue;
+          viewsByProject.set(project.id, (viewsByProject.get(project.id) ?? 0) + 1);
+          viewsByCategory.set(project.category_id, (viewsByCategory.get(project.category_id) ?? 0) + 1);
+          const eventDate = new Date(event.created_at);
+          if (period === 'daily') chartValues[Math.floor(eventDate.getHours() / 4)] += 1;
+          else if (period === 'weekly') {
+            const eventDay = new Date(eventDate.getFullYear(), eventDate.getMonth(), eventDate.getDate());
+            const dayIndex = Math.floor((eventDay.getTime() - start.getTime()) / 86400000);
+            if (dayIndex >= 0 && dayIndex < 7) chartValues[dayIndex] += 1;
+          } else chartValues[Math.floor((eventDate.getDate() - 1) / 7)] += 1;
+        }
+        const chart = chartValues.map((value, index) => {
+          if (period === 'daily') return { label: `${String(index * 4).padStart(2, '0')}–${String(index * 4 + 4).padStart(2, '0')}`, value };
+          if (period === 'monthly') return { label: `Week ${index + 1}`, value };
+          const date = new Date(start);
+          date.setDate(date.getDate() + index);
+          return { label: date.toLocaleDateString(undefined, { weekday: 'short' }), value };
+        });
+        const maxViews = Math.max(1, ...chartValues);
+        this.$('#report-chart').innerHTML = chart.map(item => `
+          <div class="report-bar-wrap"><strong>${item.value.toLocaleString()}</strong><div class="report-bar" style="height:${Math.max(14, item.value / maxViews * 118)}px"></div><span>${item.label}</span></div>`).join('');
+        const newDesigners = data.designers.filter(designer => {
+          const createdAt = new Date(designer.created_at);
+          return createdAt >= start && createdAt < end;
+        }).length;
+        const currentShortlists = data.projects.reduce((total, project) => total + Number(project.shortlists ?? 0), 0);
+        this.$('#report-stats').innerHTML = [
+          ['New designers', newDesigners, `${report.dateLabel}: ${dateInput.value}`],
+          ['Project views', data.activity.length, 'Recorded view events'],
+          ['Current shortlists', currentShortlists, 'Favourites currently saved']
+        ].map(([label, value, detail]) => `<article class="report-stat"><span>${label}</span><strong>${Number(value).toLocaleString()}</strong><small>${esc(detail)}</small></article>`).join('');
+        this.$('#report-categories').innerHTML = data.categories.map(category => {
+          const views = viewsByCategory.get(category.id) ?? 0;
+          const projects = data.projects.filter(project => project.category_id === category.id);
+          const shortlists = projects.reduce((total, project) => total + Number(project.shortlists ?? 0), 0);
+          const newProjects = projects.filter(project => {
+            const createdAt = new Date(project.created_at);
+            return createdAt >= start && createdAt < end;
+          }).length;
+          const share = data.activity.length ? views / data.activity.length * 100 : 0;
+          return `<tr><td><strong>${esc(category.name)}</strong></td><td>${views.toLocaleString()}</td><td><div class="report-share"><span><i style="width:${share}%"></i></span>${share.toFixed(1)}%</div></td><td>${shortlists.toLocaleString()}</td><td>${newProjects.toLocaleString()}</td></tr>`;
+        }).join('') || '<tr><td colspan="5">No categories found.</td></tr>';
+        this.$('#report-projects').innerHTML = [...data.projects]
+          .sort((left, right) => (viewsByProject.get(right.id) ?? 0) - (viewsByProject.get(left.id) ?? 0))
+          .slice(0, 10)
+          .map(project => `<tr><td><strong>${esc(project.title)}</strong></td><td>${esc(companyNames.get(project.designer_id) ?? '—')}</td><td>${(viewsByProject.get(project.id) ?? 0).toLocaleString()}</td><td>${Number(project.shortlists ?? 0).toLocaleString()}</td></tr>`)
+          .join('') || '<tr><td colspan="4">No published projects found.</td></tr>';
+      } catch (error) {
+        if (currentRequest === requestId && this.$('#report-error')) {
+          this.$('#report-error').textContent = `Could not load report data: ${error.message}`;
+        }
+      }
+    };
     const stepDate = direction => {
       const date = period === 'monthly'
         ? new Date(`${dateInput.value}-01T12:00:00`)
@@ -2260,22 +2437,38 @@ class App {
       else if (period === 'weekly') date.setDate(date.getDate() + direction * 7);
       else date.setMonth(date.getMonth() + direction);
       dateInput.value = period === 'monthly' ? toDateValue(date).slice(0, 7) : toDateValue(date);
+      loadReport();
     };
     this.$('#report-previous').onclick = () => stepDate(-1);
     this.$('#report-next').onclick = () => stepDate(1);
+    dateInput.onchange = loadReport;
     this.$('#report-export').onclick = () => {
+      if (!reportData) {
+        this.$('#report-error').textContent = 'Report data is not loaded yet.';
+        return;
+      }
+      const projectsById = new Map(reportData.projects.map(project => [project.id, project]));
+      const viewsByProject = new Map();
+      const viewsByCategory = new Map();
+      for (const event of reportData.activity) {
+        const project = projectsById.get(event.project_id);
+        if (!project) continue;
+        viewsByProject.set(project.id, (viewsByProject.get(project.id) ?? 0) + 1);
+        viewsByCategory.set(project.category_id, (viewsByCategory.get(project.category_id) ?? 0) + 1);
+      }
       const csvRows = [
-        ['Report', report.title],
-        [report.dateLabel, dateInput.value],
-        [],
-        ['Metric', 'Value', 'Change'],
-        ...report.metrics.map(metric => [metric.label, metric.value, metric.delta]),
-        [],
-        ['Category', 'Views', 'Share of views', 'Shortlists', 'New IDPs'],
-        ...report.categories.map(category => [category.name, category.views, `${category.share}%`, category.shortlists, category.newIds]),
-        [],
-        ['Project', 'Company', 'Views', 'Shortlists'],
-        ...report.projects.map(project => [project.title, project.company, project.views, project.shortlists])
+        ['Report', report.title], [report.dateLabel, dateInput.value], [],
+        ['Metric', 'Value'], ['Project views', reportData.activity.length],
+        ['Current shortlists', reportData.projects.reduce((total, project) => total + Number(project.shortlists ?? 0), 0)], [],
+        ['Category', 'Views', 'Current shortlists'],
+        ...reportData.categories.map(category => [
+          category.name,
+          viewsByCategory.get(category.id) ?? 0,
+          reportData.projects.filter(project => project.category_id === category.id)
+            .reduce((total, project) => total + Number(project.shortlists ?? 0), 0)
+        ]),
+        [], ['Project', 'Designer ID', 'Views', 'Shortlists'],
+        ...reportData.projects.map(project => [project.title, project.designer_id, viewsByProject.get(project.id) ?? 0, project.shortlists ?? 0])
       ];
       const csv = csvRows.map(row => row.map(value => `"${String(value ?? '').replace(/"/g, '""')}"`).join(',')).join('\r\n');
       const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
@@ -2285,6 +2478,110 @@ class App {
       link.click();
       URL.revokeObjectURL(url);
     };
+    loadReport();
+    this.subscribeToAnalytics(loadReport, null, ['projects', 'project_activity', 'profiles', 'categories', 'companies']);
+  }
+
+  async platformDashboardView() {
+    this.show(`<section class="idp-shell">
+      <aside class="idp-sidebar">
+        <div class="idp-nav-stack">
+          <button type="button" class="idp-nav-item active" data-nav="dashboard">Dashboard</button>
+          <button type="button" class="idp-nav-item" data-nav="categories">IDP categories</button>
+          <button type="button" class="idp-nav-item" data-nav="verification">Designer verification</button>
+          <button type="button" class="idp-nav-item" data-nav="feedback">User feedback</button>
+        </div>
+        <div class="idp-nav-group"><span class="idp-nav-group-title">Reports</span>
+          <div class="idp-nav-stack">
+            <button type="button" class="idp-nav-item" data-nav="dailyReport">Daily report</button>
+            <button type="button" class="idp-nav-item" data-nav="weeklyReport">Weekly report</button>
+            <button type="button" class="idp-nav-item" data-nav="monthlyReport">Monthly report</button>
+          </div>
+        </div>
+      </aside>
+      <div class="idp-main">
+        <div class="idp-header"><div><h1>Dashboard</h1><p>Platform activity · <span>${new Date().toLocaleDateString()}</span></p></div>
+          <div class="idp-header-actions"><button class="idp-secondary-button" data-nav="dailyReport">Daily report</button><button class="idp-secondary-button" data-nav="monthlyReport">Monthly report</button></div>
+        </div>
+        <p id="platform-analytics-error" class="err" role="alert"></p>
+        <p id="analytics-live-status" class="idp-note" aria-live="polite">Loading current data…</p>
+        <div class="idp-metrics" id="platform-analytics-metrics"></div>
+        <div class="idp-content-grid">
+          <section class="idp-panel idp-graph-panel"><h2>Views, last 7 days</h2><div class="idp-chart" id="platform-views-chart" aria-label="Weekly views chart"></div>
+            <button type="button" class="idp-link-button" data-nav="weeklyReport">View weekly report</button></section>
+          <aside class="idp-panel idp-side-panel"><h2>Top categories, last 7 days</h2><div class="idp-category-list" id="platform-top-categories"></div>
+            <button type="button" class="idp-manage-button" data-nav="categories">Manage categories</button></aside>
+        </div>
+        <section class="idp-panel idp-table-panel"><h2>Top projects, last 7 days</h2><table class="idp-project-table">
+          <thead><tr><th>Project</th><th>Company</th><th>Views</th><th>Current shortlists</th></tr></thead><tbody id="platform-top-projects"></tbody>
+        </table></section>
+        <p class="idp-note">View history starts when the view-history migration is applied; earlier aggregate project totals cannot be assigned to dates. Shortlist totals show favourites currently saved.</p>
+      </div>
+    </section>`);
+    this.bindPlatformNavigation();
+    let requestId = 0;
+    const loadDashboard = async () => {
+      const currentRequest = ++requestId;
+      try {
+        const start = new Date();
+        start.setHours(0, 0, 0, 0);
+        start.setDate(start.getDate() - 6);
+        const end = new Date();
+        end.setHours(0, 0, 0, 0);
+        end.setDate(end.getDate() + 1);
+        const data = await this.designers.platformReportData(start.toISOString(), end.toISOString());
+        if (currentRequest !== requestId || !this.$('#platform-views-chart')) return;
+        const projectsById = new Map(data.projects.map(project => [project.id, project]));
+        const viewsByProject = new Map();
+        const viewsByCategory = new Map();
+        const dailyViews = Array(7).fill(0);
+        for (const event of data.activity) {
+          const project = projectsById.get(event.project_id);
+          if (!project) continue;
+          viewsByProject.set(project.id, (viewsByProject.get(project.id) ?? 0) + 1);
+          viewsByCategory.set(project.category_id, (viewsByCategory.get(project.category_id) ?? 0) + 1);
+          const eventDate = new Date(event.created_at);
+          const eventDay = new Date(eventDate.getFullYear(), eventDate.getMonth(), eventDate.getDate());
+          const dayIndex = Math.floor((eventDay.getTime() - start.getTime()) / 86400000);
+          if (dayIndex >= 0 && dayIndex < 7) dailyViews[dayIndex] += 1;
+        }
+        const newDesigners = data.designers.filter(designer => new Date(designer.created_at) >= start).length;
+        const totalShortlists = data.projects.reduce((total, project) => total + Number(project.shortlists ?? 0), 0);
+        this.$('#platform-analytics-metrics').innerHTML = [
+          ['New designers, 7 days', newDesigners],
+          ['Project views, 7 days', data.activity.length],
+          ['Current shortlists', totalShortlists],
+          ['Published projects', data.projects.length]
+        ].map(([label, value]) => `<article class="idp-metric"><span class="idp-metric-label">${label}</span><strong>${Number(value).toLocaleString()}</strong></article>`).join('');
+        const maxViews = Math.max(1, ...dailyViews);
+        this.$('#platform-views-chart').innerHTML = dailyViews.map((value, index) => {
+          const date = new Date(start);
+          date.setDate(date.getDate() + index);
+          return `<div class="idp-bar-wrap"><div class="idp-bar" style="height:${Math.max(3, value / maxViews * 160)}px"></div><span>${date.toLocaleDateString(undefined, { weekday: 'short' })} (${value})</span></div>`;
+        }).join('');
+        const categoryViews = data.categories.map(category => ({
+          name: category.name,
+          views: viewsByCategory.get(category.id) ?? 0
+        })).sort((left, right) => right.views - left.views);
+        const maxCategoryViews = Math.max(1, ...categoryViews.map(category => category.views));
+        this.$('#platform-top-categories').innerHTML = categoryViews.map(category => `
+          <div class="idp-category-row"><span>${esc(category.name)}</span><div class="idp-category-track"><i style="width:${category.views / maxCategoryViews * 100}%"></i></div><strong>${category.views.toLocaleString()}</strong></div>`).join('')
+          || '<p>No categories found.</p>';
+        const companyNames = new Map(data.companies.map(company => [company.designer_id, company.name]));
+        this.$('#platform-top-projects').innerHTML = [...data.projects]
+          .sort((left, right) => (viewsByProject.get(right.id) ?? 0) - (viewsByProject.get(left.id) ?? 0))
+          .slice(0, 5)
+          .map(project => `<tr><td>${esc(project.title)}</td><td>${esc(companyNames.get(project.designer_id) ?? '—')}</td><td>${(viewsByProject.get(project.id) ?? 0).toLocaleString()}</td><td>${Number(project.shortlists ?? 0).toLocaleString()}</td></tr>`)
+          .join('') || '<tr><td colspan="4">No published projects found.</td></tr>';
+        this.$('#platform-analytics-error').textContent = '';
+      } catch (error) {
+        if (currentRequest === requestId && this.$('#platform-analytics-error')) {
+          this.$('#platform-analytics-error').textContent = `Could not load platform analytics: ${error.message}`;
+        }
+      }
+    };
+    loadDashboard();
+    this.subscribeToAnalytics(loadDashboard, null, ['projects', 'project_activity', 'profiles', 'categories', 'companies']);
   }
 
   async dashboardView() {
@@ -2296,116 +2593,13 @@ class App {
         this.showDesignerPage(`<div class="designer-dashboard-error err" role="alert">${esc(error.message)}</div>`, 'dashboard');
       }
     }
-
-    const statData = [
-      { label: 'New IDs today', value: 5, delta: '+1 vs yesterday' },
-      { label: 'Views today', value: 125, delta: '+8% vs yesterday' },
-      { label: 'Shortlists today', value: 28, delta: '+3 vs yesterday' },
-      { label: 'Categories', value: 4, delta: '340 projects' }
-    ];
-    const weekly = [120, 135, 150, 140, 160, 155, 131];
-    const categories = [
-      { name: 'Residential', count: 412 },
-      { name: 'Commercial', count: 268 },
-      { name: 'Small space', count: 190 },
-      { name: 'Luxury', count: 121 }
-    ];
-    const projects = [
-      { title: 'Japandi landed home', company: 'Kiln Design', views: 112, shortlists: 26 },
-      { title: 'Scandinavian 4-room flat', company: 'Oakline Studio', views: 98, shortlists: 22 },
-      { title: 'Warm minimalist condo', company: 'Mira & Co', views: 85, shortlists: 19 }
-    ];
-    this.show(`<section class="idp-shell">
-      <aside class="idp-sidebar">
-        <div class="idp-nav-stack">
-          <button type="button" class="idp-nav-item active" data-nav="dashboard">Dashboard</button>
-          <button type="button" class="idp-nav-item" data-nav="categories">IDP categories</button>
-          <button type="button" class="idp-nav-item" data-nav="verification">Designer verification</button>
-          <button type="button" class="idp-nav-item" data-nav="feedback">User feedback</button>
-        </div>
-        <div class="idp-nav-group">
-          <span class="idp-nav-group-title">Reports</span>
-          <div class="idp-nav-stack">
-            <button type="button" class="idp-nav-item" data-nav="dailyReport">Daily report</button>
-            <button type="button" class="idp-nav-item" data-nav="weeklyReport">Weekly report</button>
-            <button type="button" class="idp-nav-item" data-nav="monthlyReport">Monthly report</button>
-          </div>
-        </div>
-      </aside>
-      <div class="idp-main">
-        <div class="idp-header">
-          <div>
-            <h1>Dashboard</h1>
-            <p>Platform activity at a glance · <span>today's date</span></p>
-          </div>
-          <div class="idp-header-actions">
-            <button type="button" class="idp-secondary-button" data-nav="dailyReport">Daily report</button>
-            <button type="button" class="idp-secondary-button" data-nav="monthlyReport">Monthly report</button>
-          </div>
-        </div>
-
-        <div class="idp-metrics">
-          ${statData.map((stat, index) => `<article class="idp-metric" ${index === 3 ? 'style="display:flex;align-items:center;justify-content:center;"' : ''}>
-            <span class="idp-metric-label">${stat.label}</span>
-            <strong>${stat.value}</strong>
-            <small>${stat.delta}</small>
-          </article>`).join('')}
-        </div>
-
-        <div class="idp-content-grid">
-          <section class="idp-panel idp-graph-panel">
-            <h2>Views, last 7 days</h2>
-            <div class="idp-chart" aria-label="Weekly views chart">
-              ${weekly.map((value, i) => `<div class="idp-bar-wrap"><div class="idp-bar" style="height:${value}px"></div><span>${['Mon','Tue','Wed','Thu','Fri','Sat','Sun'][i]}</span></div>`).join('')}
-            </div>
-            <button type="button" class="idp-link-button" data-nav="weeklyReport">View weekly report</button>
-          </section>
-
-          <aside class="idp-panel idp-side-panel">
-            <h2>Top categories this week</h2>
-            <div class="idp-category-list">
-              ${categories.map(category => `<div class="idp-category-row"><span>${category.name}</span><div class="idp-category-track"><i></i></div><strong>${category.count}</strong></div>`).join('')}
-            </div>
-            <button type="button" class="idp-manage-button" data-nav="categories">Manage categories</button>
-          </aside>
-        </div>
-
-        <section class="idp-panel idp-table-panel">
-          <h2>Top projects this week</h2>
-          <table class="idp-project-table">
-            <thead>
-              <tr><th>Project</th><th>Company</th><th>Views</th><th>Shortlists</th></tr>
-            </thead>
-            <tbody>
-              ${projects.map(project => `<tr><td>${project.title}</td><td>${project.company}</td><td>${project.views}</td><td>${project.shortlists}</td></tr>`).join('')}
-            </tbody>
-          </table>
-        </section>
-
-        <div class="idp-note">Sample figures that match the weekly report.</div>
-        <div class="idp-alert-card">
-          <div class="idp-alert-head">
-            <strong>Designer awaiting verification</strong>
-            <button type="button" aria-label="Close notification">×</button>
-          </div>
-          <p>[Company name] registered and needs verification.</p>
-          <button type="button" class="idp-alert-link" data-nav="verification">Review designer →</button>
-        </div>
-      </div>
-    </section>`);
-
-    this.bindPlatformNavigation();
-
-    const fab = this.$('#message-fab');
-    if (fab) {
-      fab.onclick = () => this.user ? this.open('messages') : this.loginView('login');
-    }
+    return this.platformDashboardView();
   }
 
   async designerDashboardView() {
     const designerId = this.designerDashboardUserId;
     if (!designerId) throw new Error('No active interior designer is available to preview.');
-    const [{ projects }, categories, drafts] = await Promise.all([
+    let [{ projects }, categories, drafts] = await Promise.all([
       this.designers.designer(designerId),
       this.designers.categories(),
       this.designers.designerProjectDrafts(designerId)
@@ -2417,8 +2611,8 @@ class App {
       `<option value="${category.id}">${esc(category.name)}</option>`
     ).join('');
     const publishedProjects = projects.filter(project => project.visibility !== 'draft');
-    const totalViews = publishedProjects.reduce((total, project) => total + Number(project.views ?? 0), 0);
-    const totalShortlists = publishedProjects.reduce((total, project) => total + Number(project.shortlists ?? 0), 0);
+    let totalViews = publishedProjects.reduce((total, project) => total + Number(project.views ?? 0), 0);
+    let totalShortlists = publishedProjects.reduce((total, project) => total + Number(project.shortlists ?? 0), 0);
 
     this.show(`<section class="idp-shell designer-dashboard">
       ${this.designerDashboardSidebar('dashboard')}
@@ -2428,10 +2622,11 @@ class App {
           <button type="button" class="btn designer-add-project" id="designer-add-project" ${this.isReadOnlyPreview ? 'disabled title="Project creation is disabled in preview mode"' : ''}>+ Add project</button>
         </div>
         <div class="designer-dashboard-metrics">
-          <article><span>Total views</span><strong>${totalViews.toLocaleString()}</strong></article>
-          <article><span>Times shortlisted</span><strong>${totalShortlists.toLocaleString()}</strong></article>
-          <article><span>Published projects</span><strong>${publishedProjects.length.toLocaleString()}</strong></article>
+          <article><span>Total views</span><strong id="portfolio-total-views">${totalViews.toLocaleString()}</strong></article>
+          <article><span>Current shortlists</span><strong id="portfolio-total-shortlists">${totalShortlists.toLocaleString()}</strong></article>
+          <article><span>Published projects</span><strong id="portfolio-published-count">${publishedProjects.length.toLocaleString()}</strong></article>
         </div>
+        <p id="analytics-live-status" class="designer-insight-note" aria-live="polite">Connecting to live updates…</p>
         <section class="designer-project-panel" aria-labelledby="designer-projects-heading">
           <div class="designer-project-panel-heading">
             <h2 id="designer-projects-heading">Projects</h2>
@@ -2446,7 +2641,7 @@ class App {
           <p id="designer-dashboard-error" class="err" role="alert"></p>
           <div class="designer-project-table-wrap">
             <table class="designer-project-table">
-              <thead><tr><th>Project</th><th>Category</th><th>Stage</th><th>Progress</th><th>Visibility</th><th>Views</th><th>Shortlisted</th><th>Actions</th></tr></thead>
+              <thead><tr><th>Project</th><th>Category</th><th>Stage</th><th>Progress</th><th>Visibility</th><th>Views</th><th>Current shortlists</th><th>Actions</th></tr></thead>
               <tbody id="designer-project-rows"></tbody>
             </table>
           </div>
@@ -2646,6 +2841,29 @@ class App {
       if (button) this.openDesignerDashboardView(button.dataset.designerView);
     };
     renderProjects();
+    let portfolioRefreshSequence = 0;
+    const refreshPortfolio = async () => {
+      const currentSequence = ++portfolioRefreshSequence;
+      try {
+        const latest = await this.designers.designer(designerId);
+        if (currentSequence !== portfolioRefreshSequence || !this.$('#designer-project-rows')) return;
+        projects = latest.projects;
+        publishedProjects.splice(0, publishedProjects.length,
+          ...projects.filter(project => project.visibility !== 'draft'));
+        totalViews = publishedProjects.reduce((total, project) => total + Number(project.views ?? 0), 0);
+        totalShortlists = publishedProjects.reduce((total, project) => total + Number(project.shortlists ?? 0), 0);
+        this.$('#portfolio-total-views').textContent = totalViews.toLocaleString();
+        this.$('#portfolio-total-shortlists').textContent = totalShortlists.toLocaleString();
+        this.$('#portfolio-published-count').textContent = publishedProjects.length.toLocaleString();
+        renderProjects();
+      } catch (error) {
+        const errorElement = this.$('#designer-dashboard-error');
+        if (currentSequence === portfolioRefreshSequence && errorElement) {
+          errorElement.textContent = `Could not refresh project views: ${error.message}`;
+        }
+      }
+    };
+    this.subscribeToAnalytics(refreshPortfolio, designerId);
   }
 
   async editProjectView(projectId) {
@@ -2961,15 +3179,16 @@ class App {
   async interestInsightsView() {
     const designerId = this.designerDashboardUserId;
     if (!designerId) throw new Error('No active interior designer is available to preview.');
-    const [{ projects }, activity] = await Promise.all([
+    const [{ projects }, activityRows] = await Promise.all([
       this.designers.designer(designerId),
       this.designers.designerActivity(designerId)
     ]);
-    const publishedProjects = projects.filter(project => project.visibility !== 'draft');
+    let publishedProjects = projects.filter(project => project.visibility !== 'draft');
+    let activity = activityRows;
     const categories = await this.designers.categories();
     const categoriesById = new Map(categories.map(category => [category.id, category.name]));
-    const totalViews = publishedProjects.reduce((total, project) => total + Number(project.views ?? 0), 0);
-    const totalShortlists = publishedProjects.reduce((total, project) => total + Number(project.shortlists ?? 0), 0);
+    let totalViews = publishedProjects.reduce((total, project) => total + Number(project.views ?? 0), 0);
+    let totalShortlists = publishedProjects.reduce((total, project) => total + Number(project.shortlists ?? 0), 0);
     let range = '7';
     let sort = 'views';
     const today = new Date();
@@ -2977,7 +3196,10 @@ class App {
     const renderInsights = () => {
       const days = range === '30' ? 30 : range === '7' ? 7 : null;
       const cutoff = days ? new Date(today) : null;
-      if (cutoff) cutoff.setDate(cutoff.getDate() - (days - 1));
+      if (cutoff) {
+        cutoff.setHours(0, 0, 0, 0);
+        cutoff.setDate(cutoff.getDate() - (days - 1));
+      }
       const recentActivity = activity.filter(row => row.activity_type === 'view' && (!cutoff || new Date(row.created_at) >= cutoff));
       const daily = new Map();
       for (const row of recentActivity) {
@@ -2993,13 +3215,16 @@ class App {
         : (() => {
           const first = activity.length ? new Date(activity[0].created_at) : new Date(today.getFullYear(), today.getMonth(), 1);
           const start = new Date(first.getFullYear(), first.getMonth(), 1);
-          const count = Math.min(12, Math.max(1, (today.getFullYear() - start.getFullYear()) * 12 + today.getMonth() - start.getMonth() + 1));
+          const count = Math.max(1, (today.getFullYear() - start.getFullYear()) * 12 + today.getMonth() - start.getMonth() + 1);
           return Array.from({ length: count }, (_, index) => new Date(today.getFullYear(), today.getMonth() - count + index + 1, 1));
         })();
       const values = labels.map(date => {
         if (days) return daily.get(dateKey(date)) ?? 0;
         const month = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
-        return recentActivity.filter(row => row.created_at.startsWith(month)).length;
+        return recentActivity.filter(row => {
+          const createdAt = new Date(row.created_at);
+          return `${createdAt.getFullYear()}-${String(createdAt.getMonth() + 1).padStart(2, '0')}` === month;
+        }).length;
       });
       this.$('#insights-chart-title').textContent = days ? 'Views per day' : 'Views by month';
       const max = Math.max(1, ...values);
@@ -3014,21 +3239,28 @@ class App {
         return `<tr><td><strong>${esc(project.title)}</strong></td><td>${esc(categoriesById.get(project.category_id) ?? 'Interior design')}</td><td>${views.toLocaleString()}</td><td>${shortlists.toLocaleString()}</td><td>${views ? `${(shortlists / views * 100).toFixed(1)}%` : '—'}</td></tr>`;
       }).join('') || '<tr><td colspan="5" class="designer-insights-empty">Add projects to see their engagement.</td></tr>';
       this.$('#insight-range-note').textContent = 'Daily view history starts when this dashboard migration is applied; existing project totals are shown above.';
+      const topProject = [...publishedProjects].sort((a, b) => Number(b.views ?? 0) - Number(a.views ?? 0))[0];
+      this.$('#insights-total-views').textContent = totalViews.toLocaleString();
+      this.$('#insights-total-shortlists').textContent = totalShortlists.toLocaleString();
+      this.$('#insights-shortlist-rate').textContent = totalViews ? `${(totalShortlists / totalViews * 100).toFixed(1)}%` : '0%';
+      this.$('#insights-top-project').textContent = topProject?.title ?? 'No projects yet';
+      this.$('#insights-top-project-views').textContent = `${Number(topProject?.views ?? 0).toLocaleString()} views`;
     };
     this.showDesignerPage(`
       <div class="designer-page-heading"><div><h1>Interest insights</h1><p>See how customers find and shortlist your projects.</p></div>
         <div class="designer-insight-range" role="group" aria-label="View history range"><button class="active" data-range="7">Last 7 days</button><button data-range="30">Last 30 days</button><button data-range="all">All time</button></div>
       </div>
       <div class="designer-insight-metrics">
-        <article><span>Total views</span><strong>${totalViews.toLocaleString()}</strong><small>All time</small></article>
-        <article><span>Times shortlisted</span><strong>${totalShortlists.toLocaleString()}</strong><small>Added to favourites</small></article>
-        <article><span>Shortlist rate</span><strong>${totalViews ? `${(totalShortlists / totalViews * 100).toFixed(1)}%` : '0%'}</strong><small>Shortlists per view</small></article>
+        <article><span>Total views</span><strong id="insights-total-views">${totalViews.toLocaleString()}</strong><small>All time</small></article>
+        <article><span>Current shortlists</span><strong id="insights-total-shortlists">${totalShortlists.toLocaleString()}</strong><small>Favourites currently saved</small></article>
+        <article><span>Current shortlist rate</span><strong id="insights-shortlist-rate">${totalViews ? `${(totalShortlists / totalViews * 100).toFixed(1)}%` : '0%'}</strong><small>Saved favourites per view</small></article>
       </div>
-      <section class="designer-insight-highlight"><span>Top project</span><strong>${esc([...publishedProjects].sort((a, b) => Number(b.views ?? 0) - Number(a.views ?? 0))[0]?.title ?? 'No projects yet')}</strong><small>${Number([...publishedProjects].sort((a, b) => Number(b.views ?? 0) - Number(a.views ?? 0))[0]?.views ?? 0).toLocaleString()} views</small></section>
+      <section class="designer-insight-highlight"><span>Top project</span><strong id="insights-top-project">${esc([...publishedProjects].sort((a, b) => Number(b.views ?? 0) - Number(a.views ?? 0))[0]?.title ?? 'No projects yet')}</strong><small id="insights-top-project-views">${Number([...publishedProjects].sort((a, b) => Number(b.views ?? 0) - Number(a.views ?? 0))[0]?.views ?? 0).toLocaleString()} views</small></section>
       <section class="designer-insight-card"><h2 id="insights-chart-title">Views per day</h2><div class="designer-insight-chart" id="insights-chart"></div></section>
       <section class="designer-insight-card"><div class="designer-insight-table-heading"><h2>By project</h2><label>Sort by<select id="insights-sort"><option value="views">Most viewed</option><option value="shortlists">Most shortlisted</option></select></label></div>
-        <div class="designer-project-table-wrap"><table class="designer-insights-table"><thead><tr><th>Project</th><th>Category</th><th>Views</th><th>Shortlisted</th><th>Shortlist rate</th></tr></thead><tbody id="insights-projects"></tbody></table></div>
+        <div class="designer-project-table-wrap"><table class="designer-insights-table"><thead><tr><th>Project</th><th>Category</th><th>Views</th><th>Current shortlists</th><th>Current shortlist rate</th></tr></thead><tbody id="insights-projects"></tbody></table></div>
       </section>
+      <p class="designer-insight-note err" id="insights-refresh-error" role="alert"></p>
       <p class="designer-insight-note" id="insight-range-note"></p>
     `, 'insights');
     renderInsights();
@@ -3043,6 +3275,28 @@ class App {
       sort = event.target.value;
       renderInsights();
     };
+    let refreshSequence = 0;
+    const refreshInsights = async () => {
+      const currentSequence = ++refreshSequence;
+      try {
+        const [designer, nextActivity] = await Promise.all([
+          this.designers.designer(designerId),
+          this.designers.designerActivity(designerId)
+        ]);
+        if (currentSequence !== refreshSequence || !this.$('#insights-projects')) return;
+        publishedProjects = designer.projects.filter(project => project.visibility !== 'draft');
+        activity = nextActivity;
+        totalViews = publishedProjects.reduce((total, project) => total + Number(project.views ?? 0), 0);
+        totalShortlists = publishedProjects.reduce((total, project) => total + Number(project.shortlists ?? 0), 0);
+        this.$('#insights-refresh-error').textContent = '';
+        renderInsights();
+      } catch (error) {
+        if (currentSequence === refreshSequence && this.$('#insights-refresh-error')) {
+          this.$('#insights-refresh-error').textContent = `Could not refresh view analytics: ${error.message}`;
+        }
+      }
+    };
+    this.subscribeToAnalytics(refreshInsights, designerId);
   }
 
   async processWorkflowView() {

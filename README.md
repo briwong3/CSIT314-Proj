@@ -37,6 +37,8 @@ The platform manager's category delete dialog uses the **Platform category reass
 
 Customer favourites live in `public.favorites`, created by the **Customer favourites and shortlist-count migration** at the end of `schema.sql`. If the rest of the schema is already installed, run that repeatable section in the Supabase SQL Editor. Its row-level security policies restrict favourites to each active customer, and a trigger keeps project shortlist totals in sync. Customers can save published projects from Browse projects, project details, and designer portfolios, then view or remove them from Favourites.
 
+Run the final **Realtime view analytics migration** section after the designer dashboard migration. It allows platform managers to read project view events and adds the `projects`, `project_activity`, `profiles`, `categories`, `companies`, and `feedback` tables to Supabase Realtime. Platform dashboards, reports, categories, designer verification, and feedback refresh from their database records. Designer portfolio and interest insights update as views are recorded. Historical daily view activity starts when the view-history migration is applied and cannot be inferred from older aggregate view counts. Verification documents are not collected by this app, so the platform queue does not show a placeholder documents action.
+
 If the app reports **Bucket not found** while creating a project or uploading a company logo/cover, open the Supabase SQL Editor for the project configured in `config.js` and run the **Storage bucket used for project photos** section in `schema.sql`. This section is safe to run again. Then retry the upload.
 
 ### Create the first User Admin
@@ -114,15 +116,17 @@ Registration supports customer and interior designer accounts. Designer registra
 
 This is a static site. Deploy `index.html`, `app.js`, and `config.js` together to any static web host that serves ES modules over HTTPS. Configure the deployed site URL and redirect URLs in Supabase Authentication settings.
 
-The daily, weekly, and monthly platform report pages currently display sample figures rather than database-derived analytics. Designer interest insights use project view and shortlist totals; dated view charts are collected after the designer dashboard migration is applied.
+Platform dashboards and reports use database-derived analytics rather than sample figures. View counts update through Supabase Realtime after the **Realtime view analytics migration** has been applied. Date-based charts show recorded events only; they do not fabricate dates for older project view totals.
 
 ## Troubleshooting
 
 - **Could not find a table or column / schema cache error:** confirm `schema.sql` ran against the same Supabase project configured in `config.js`. After schema changes, refresh the Supabase API schema cache if needed.
 - **Bucket not found when uploading a project image or company logo/cover:** run the **Storage bucket used for project photos** section in `schema.sql` in the SQL Editor for the Supabase project configured in `config.js`. Uploads require the `project-images` bucket.
 - **Designer dashboard reports a missing column or table:** run the **Designer dashboard profile, project workflow and view-history migration** block at the bottom of `schema.sql` in the SQL Editor.
+- **View analytics do not update live / platform reports cannot load view history:** run the final **Realtime view analytics migration** section in `schema.sql` after the designer dashboard migration, then reload the app.
 - **Could not find `public.project_milestones` in the schema cache:** run the latest designer dashboard migration block at the bottom of `schema.sql` against the Supabase project configured in `config.js`. The block creates this table and requests a PostgREST schema-cache reload. If the error remains, verify the SQL completed successfully and run `notify pgrst, 'reload schema';` in the SQL Editor, then reload the app.
 - **Favourites fail to load or save / the `public.favorites` table is missing:** run the **Customer favourites and shortlist-count migration** at the end of `schema.sql` in the SQL Editor for the project configured in `config.js`, then reload the app. If it still fails, verify the migration completed and refresh the PostgREST schema cache.
+- **Project details show `permission denied for table comments`:** run the **Comments access permission migration** at the end of `schema.sql` in the SQL Editor for the project configured in `config.js`, then reload the app. Project details will still open if comment access is unavailable.
 - **Appointments reports a missing table or permission error:** run the same designer dashboard migration block in the Supabase project configured in `config.js`. Appointment requests are stored in `public.appointment_requests` and protected by row-level security.
 - **Login shows `permission denied for table profiles`:** run the latest designer-dashboard migration block at the bottom of `schema.sql` in the Supabase SQL Editor, then reload and sign in again. It grants the needed table access while keeping row-level security enabled.
 - **Login says the app profile is missing:** run the latest designer-dashboard migration block at the bottom of `schema.sql`. It restores missing profiles from signup metadata; restored accounts receive the customer or designer role, while admin/platform roles must be reassigned by an administrator.

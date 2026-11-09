@@ -798,8 +798,7 @@ main.project-detail-main{max-width:1240px;margin:20px auto;padding:0 24px}
 .verification-actions{display:flex;gap:8px}
 .verification-action{min-height:38px;padding:0 13px;border:1px solid #60708a;border-radius:8px;background:#fff;color:#344158;font:inherit;font-size:13px;cursor:pointer}
 .verification-action.approve{border-color:var(--navy);background:var(--navy);color:#fff;font-weight:700}
-.verification-action:hover,.verification-doc-link:hover{text-decoration:underline}
-.verification-doc-link{padding:0;border:0;background:transparent;color:#344158;font:inherit;font-weight:600;cursor:pointer}
+.verification-action:hover{text-decoration:underline}
 .verification-status{display:inline-block;padding:5px 11px;border-radius:999px;background:#fff0d3;color:#4e4a42;font-size:12px}
 .verification-status.verified{background:#e8eaf2}
 .verification-status.rejected{background:#f8dfdb}
@@ -814,7 +813,6 @@ main.project-detail-main{max-width:1240px;margin:20px auto;padding:0 24px}
 .verification-details>div{display:grid;grid-template-columns:125px minmax(0,1fr);gap:10px;font-size:13px}
 .verification-details dt{color:#6b7484}
 .verification-details dd{margin:0;overflow-wrap:anywhere;font-weight:600}
-.verification-no-documents{margin:4px 0 0;padding:12px;border-radius:8px;background:#f3f4f7;color:#6b7484;font-size:13px}
 .verification-dialog [hidden]{display:none!important}
 .verification-dialog .account-edit-actions .btn{min-height:42px;background:var(--navy);color:#fff;font-weight:700}
 .verification-dialog .account-edit-actions .secondary-btn{border:1px solid var(--navy);background:#fff;color:var(--navy);font-weight:400}
