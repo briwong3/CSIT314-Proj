@@ -213,7 +213,7 @@ class DesignerController extends globalThis.CompanyController { // "find a desig
   async findDesigners({ q, cat, sort }) {
     const [profiles, companies, projects] = await Promise.all([
       db.from('profiles').select('id,name').eq('role', 'designer').order('name'),
-      db.from('companies').select('designer_id,name,bio'),
+      db.from('companies').select('designer_id,name,bio,logo_url,cover_url'),
       db.from('projects').select('designer_id,views,category_id,categories(name)').eq('visibility', 'published')
     ]);
     const designerProfiles = must(profiles);
@@ -848,7 +848,35 @@ class App {
     });
   }
 
-  homeView() {
+  async homeView() {
+    const fallbackDesigners = [
+      { name: 'Olivia Hart', specialties: ['Scandinavian · residential'], projectCount: 3 },
+      { name: 'Daniel Brooks', specialties: ['Industrial · commercial'], projectCount: 4 },
+      { name: 'Priya Shah', specialties: ['Japandi · landed homes'], projectCount: 5 }
+    ];
+    let featuredDesigners = fallbackDesigners;
+    try {
+      const designers = await this.designers.findDesigners({ q: '', cat: '', sort: 'projects' });
+      const rankedDesigners = designers
+        .filter(designer => designer?.name)
+        .sort((left, right) => (right.projects?.length ?? 0) - (left.projects?.length ?? 0))
+        .slice(0, 3)
+        .map(designer => ({
+          name: designer.name,
+          specialties: designer.specialties?.length ? designer.specialties : [designer.company?.name ?? 'Interior design'],
+          projectCount: designer.projects?.length ?? 0
+        }));
+      if (rankedDesigners.length) featuredDesigners = rankedDesigners;
+    } catch (error) {
+      console.warn('Could not load featured designers:', error);
+    }
+    const designerCards = featuredDesigners.map(designer => {
+      const specialty = Array.isArray(designer.specialties) && designer.specialties.length
+        ? designer.specialties.join(' · ')
+        : 'Interior design';
+      const projectCount = Number(designer.projectCount ?? 0);
+      return `<article class="designer-card"><span class="designer-avatar"></span><div><h3><a href="#home-search">${esc(designer.name)}</a></h3><p>${esc(specialty)}<br>${projectCount} ${projectCount === 1 ? 'project' : 'projects'}</p></div></article>`;
+    }).join('');
     this.show(`<div class="homepage">
       <section class="home-wrap home-hero">
         <div class="home-hero-copy">
@@ -888,12 +916,8 @@ class App {
         </div>
       </div></section>
       <section class="home-section" id="designers"><div class="home-wrap">
-        <div class="section-heading"><div><h2>Featured interior designers</h2><p class="section-subtitle">Meet the companies behind the projects.</p></div><a class="text-link" href="#home-search">View all →</a></div>
-        <div class="designer-grid">
-          <article class="designer-card"><span class="designer-avatar"></span><div><h3><a href="#home-search">Oakline Studio</a></h3><p>Scandinavian · residential<br>3 projects</p></div></article>
-          <article class="designer-card"><span class="designer-avatar"></span><div><h3><a href="#home-search">Brickhaus Interiors</a></h3><p>Industrial · commercial<br>4 projects</p></div></article>
-          <article class="designer-card"><span class="designer-avatar"></span><div><h3><a href="#home-search">Kin Design</a></h3><p>Japandi · landed homes<br>5 projects</p></div></article>
-        </div>
+        <div class="section-heading"><div><h2>Featured interior designers</h2><p class="section-subtitle">Meet the interior designers behind the projects.</p></div><a class="text-link" href="#home-search">View all →</a></div>
+        <div class="designer-grid">${designerCards}</div>
       </div></section>
       <section class="designer-cta"><div class="home-wrap"><div><h2>Are you an interior designer?</h2><p>Showcase your company and past projects, and see how many customers view and shortlist them.</p></div><button class="btn" type="button" data-action="designer-signup">Register as a designer</button></div></section>
       <footer class="site-footer"><span class="footer-brand">▣ CPU</span><span>About　 Contact　 Privacy</span><span>CSIT314 group project</span></footer>
@@ -1208,7 +1232,10 @@ class App {
       const rows = await this.designers.findDesigners({ q: this.$('#q').value, cat: this.$('#cat').value, sort: this.$('#sort').value });
       this.$('#count').textContent = `${rows.length} ${rows.length === 1 ? 'designer' : 'designers'} found`;
       this.$('#res').innerHTML = rows.map((designer, index) => `<article class="finder-designer-card">
-        <div class="designer-cover cover-${index % 4}"><span>Cover placeholder</span><i aria-hidden="true"></i></div>
+        <div class="designer-cover cover-${index % 4}" ${designer.company?.cover_url ? `style="background-image:url('${esc(designer.company.cover_url)}');background-size:cover;background-position:center"` : ''}>
+          <span>${designer.company?.cover_url ? '' : 'Cover placeholder'}</span>
+          ${designer.company?.logo_url ? `<img src="${esc(designer.company.logo_url)}" alt="${esc(designer.company?.name ?? designer.name)} logo">` : '<i aria-hidden="true"></i>'}
+        </div>
         <div class="finder-designer-info"><h2>${esc(designer.company?.name ?? designer.name)}</h2>
           <div class="designer-specialties">${designer.specialties.map(specialty => `<span>${esc(specialty)}</span>`).join('') || '<span>Interior design</span>'}</div>
           <p>${designer.projects.length} ${designer.projects.length === 1 ? 'project' : 'projects'} · ${designer.totalViews.toLocaleString()} total views</p>
@@ -2962,6 +2989,7 @@ class App {
           website: String(values.get('website') ?? '').trim() || null,
           address: String(values.get('address') ?? '').trim() || null,
         }, logoInput.files?.[0] ?? null, coverInput.files?.[0] ?? null);
+        this.showToast('Company details saved.');
         await this.companyInformationView();
         if (warning) this.$('.designer-company-error').textContent = warning;
       } catch (error) {
