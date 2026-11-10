@@ -54,7 +54,7 @@ If the app reports **Bucket not found** while creating a project or uploading a 
 
 3. Sign out and sign in again so the app loads the updated role.
 
-Keep at least one active User Admin account. User Admins can manage accounts and profile definitions; Platform Management has separate platform-only pages and permissions.
+Keep at least one active User Admin account. User Admins can manage accounts and profile definitions; Platform Management has separate platform-only pages and permissions. Password reset requests from the login page direct users to a User Admin, who can set a new password from **Accounts → Reset password**.
 
 ## 3. Deploy the account-management Edge Function
 

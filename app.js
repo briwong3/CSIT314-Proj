@@ -63,6 +63,22 @@ class AccountController {
       if (result.user?.email === email) must(await db.from('profiles').update({ email }).eq('id', id));
       return result;
     });
+    resetForm.onsubmit = this.guard(async e => {
+      const values = new FormData(e.currentTarget);
+      const password = String(values.get('password') ?? '');
+      if (password.length < 6) throw new Error('The password must be at least 6 characters.');
+      if (password !== values.get('confirmPassword')) throw new Error('The passwords do not match.');
+      const submit = resetForm.querySelector('[type="submit"]');
+      submit.disabled = true;
+      try {
+        await this.admin.resetPassword(selectedAccount.id, password);
+        closeDialog(resetDialog);
+        resetForm.reset();
+        this.ok(`Password reset for ${selectedAccount.name}.`);
+      } finally {
+        submit.disabled = false;
+      }
+    });
   }
   async changePassword(email, currentPassword, password) {
     must(await db.auth.signInWithPassword({ email, password: currentPassword }));
@@ -213,7 +229,7 @@ class DesignerController extends globalThis.CompanyController { // "find a desig
   async findDesigners({ q, cat, sort }) {
     const [profiles, companies, projects] = await Promise.all([
       db.from('profiles').select('id,name').eq('role', 'designer').order('name'),
-      db.from('companies').select('designer_id,name,bio'),
+      db.from('companies').select('designer_id,name,bio,logo_url,cover_url'),
       db.from('projects').select('designer_id,views,category_id,categories(name)').eq('visibility', 'published')
     ]);
     const designerProfiles = must(profiles);
@@ -470,6 +486,7 @@ class App {
   $$ = s => document.querySelectorAll(s);
   labels = { dashboard: 'Dashboard', categories: 'IDP categories', accounts: 'Accounts', profiles: 'User profiles', projects: 'Browse projects', designers: 'Find a designer', favorites: 'Favourites', messages: 'Direct messages', account: 'My account', users: 'Users', logs: 'Audit log', notifications: 'Notifications' };
   get isReadOnlyPreview() { return this.user?.role === 'admin' && this.viewAs !== null; }
+  get isCustomerPreview() { return this.user?.role === 'admin' && this.viewAs === 'customer'; }
   get designerDashboardUserId() { return this.viewAs === 'designer' ? this.previewDesignerId : this.user.id; }
   get canUseDirectMessages() { return ['customer', 'designer'].includes(this.user?.role) && !this.isReadOnlyPreview; }
 
@@ -520,9 +537,16 @@ class App {
     this.$('#nav').innerHTML = this.user?.role === 'platform'
       ? ''
       : this.user
-        ? tabs.map(t => `<button data-t="${t}" class="${t === this.tab ? 'on' : ''}"${t === 'favorites' && this.isReadOnlyPreview ? ' disabled title="Favourites are switched off in preview mode"' : ''}>${this.labels[t]}</button>`).join('')
-        : '<a href="#featured">Browse projects</a><a href="#designers">Find a designer</a><span class="nav-coming-soon" aria-disabled="true" title="Favourites page coming soon">Favourites</span>';
-    this.$('#nav').onclick = e => e.target.dataset.t && this.open(e.target.dataset.t);
+        ? tabs.map(t => `<button data-t="${t}" class="${t === this.tab ? 'on' : ''}">${this.labels[t]}</button>`).join('')
+        : '<a href="#featured">Browse projects</a><a href="#designers">Find a designer</a><a href="#" data-m="login">Favourites</a>';
+    this.$('#nav').onclick = e => {
+      const link = e.target.closest('[data-m], [data-t]');
+      if (!link) return;
+      if (link.dataset.m) {
+        e.preventDefault();
+        this.loginView(link.dataset.m);
+      } else this.open(link.dataset.t);
+    };
     this.$('#who').innerHTML = this.user
       ? `<div class="notification-control"><button type="button" class="notification-bell" id="notification-bell" aria-label="Notifications" aria-expanded="false" title="Notifications"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9"/><path d="M10 21h4"/></svg><span class="notification-count" id="notification-count" hidden></span></button></div>${this.user.role === 'admin' ? `<label class="view-as-control"><span>View as</span><select id="view-as" aria-label="View as role"><option value="admin" ${this.viewAs === null ? 'selected' : ''}>User Admin</option><option value="customer" ${this.viewAs === 'customer' ? 'selected' : ''}>Customer</option><option value="designer" ${this.viewAs === 'designer' ? 'selected' : ''}>Interior Designer</option></select></label>` : ''}<button class="account-link" id="account-link" title="${this.isReadOnlyPreview ? 'Signed in as User Admin' : 'My account'}" ${this.isReadOnlyPreview ? 'disabled' : ''}>${esc(this.user.name)}${this.isReadOnlyPreview ? ' (User Admin)' : ''}</button><button class="logout-link" id="out">Log out</button>`
       : '<button class="btn" data-m="login">Log in</button><button class="btn" data-m="register">Sign up</button>';
@@ -571,9 +595,9 @@ class App {
     this.homeView();
   }
   async open(t, ...args) {
-    if (this.isReadOnlyPreview && (this.viewAs === 'designer' ? t !== 'dashboard' : !['projects', 'designers'].includes(t))) return;
+    if (this.isReadOnlyPreview && (this.viewAs === 'designer' ? t !== 'dashboard' : !['projects', 'designers', 'favorites'].includes(t))) return;
     if (t === 'messages' && !this.canUseDirectMessages) return;
-    if (t === 'favorites' && (this.user?.role !== 'customer' || this.isReadOnlyPreview)) return;
+    if (t === 'favorites' && this.user?.role !== 'customer' && !this.isCustomerPreview) return;
     if (['categories', 'verification', 'feedback', 'dailyReport', 'weeklyReport', 'monthlyReport'].includes(t) && this.user?.role !== 'platform') return;
     this.tab = t;
     this.shell();
@@ -757,12 +781,14 @@ class App {
   }
   favoriteLabel(saved) { return saved ? 'Remove from favourites' : 'Add to favourites'; }
   favoriteButton(projectId, labelled = false) {
-    if (!this.canFavorite || !this.favoritesAvailable) return '';
+    const previewOnly = this.isCustomerPreview;
+    if ((!this.canFavorite && !previewOnly) || (!this.favoritesAvailable && !previewOnly)) return '';
     const id = Number(projectId);
     const saved = this.favoriteIds.has(id);
     const label = this.favoriteLabel(saved);
     const heart = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20.5s-7.5-4.6-9.6-9.2C.9 7.8 3 4 6.6 4c2 0 3.7 1.1 5.4 3 1.7-1.9 3.4-3 5.4-3 3.6 0 5.7 3.8 4.2 7.3-2.1 4.6-9.6 9.2-9.6 9.2z"/></svg>';
-    return `<button type="button" class="fav-btn${labelled ? ' fav-btn-labelled' : ''}${saved ? ' on' : ''}" data-fav="${id}" aria-pressed="${saved}" aria-label="${label}" title="${label}">${heart}${labelled ? `<span class="fav-text">${label}</span>` : ''}</button>`;
+    const previewLabel = 'Favourites are read-only in customer preview';
+    return `<button type="button" class="fav-btn${labelled ? ' fav-btn-labelled' : ''}${saved ? ' on' : ''}" data-fav="${id}" aria-pressed="${saved}" aria-label="${previewOnly ? previewLabel : label}" title="${previewOnly ? previewLabel : label}" ${previewOnly ? 'disabled' : ''}>${heart}${labelled ? `<span class="fav-text">${previewOnly ? 'Read-only preview' : label}</span>` : ''}</button>`;
   }
   setFavoriteButton(button, saved) {
     const label = this.favoriteLabel(saved);
@@ -808,6 +834,14 @@ class App {
     setTimeout(() => toast.remove(), 9000);
   }
   async favoritesView() {
+    if (this.isCustomerPreview) {
+      this.show(`<section class="project-browser"><h1>Favourites</h1><p class="finder-intro">Your saved projects will appear here.</p>
+        <div class="project-browser-grid"><div class="project-empty-state"><h2>Read-only customer preview</h2>
+          <p>Saved projects are only available when signed in as a customer.</p>
+          <button class="btn" type="button" id="browse-projects">Browse projects</button></div></div></section>`);
+      this.$('#browse-projects').onclick = () => this.open('projects');
+      return;
+    }
     this.show(`<section class="project-browser"><h1>Favourites</h1><p class="finder-intro">Projects you have saved. Open one to see its details, or remove it from your list.</p>
       <p class="results-count" id="count"></p><div id="res" class="project-browser-grid"></div><p id="msg" class="err" role="alert"></p></section>`);
     const result = await Promise.allSettled([this.loadFavoriteIds(), this.favorites.list()]);
@@ -848,7 +882,42 @@ class App {
     });
   }
 
-  homeView() {
+  async homeView() {
+    const designerPortraits = [
+      'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=160&h=160&q=80',
+      'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?auto=format&fit=crop&w=160&h=160&q=80',
+      'https://images.unsplash.com/photo-1531123897727-8f129e1688ce?auto=format&fit=crop&w=160&h=160&q=80'
+    ];
+    const fallbackDesigners = [
+      { name: 'Olivia Hart', specialties: ['Scandinavian · residential'], projectCount: 3 },
+      { name: 'Daniel Brooks', specialties: ['Industrial · commercial'], projectCount: 4 },
+      { name: 'Priya Shah', specialties: ['Japandi · landed homes'], projectCount: 5 }
+    ];
+    let featuredDesigners = fallbackDesigners;
+    try {
+      const designers = await this.designers.findDesigners({ q: '', cat: '', sort: 'projects' });
+      const rankedDesigners = designers
+        .filter(designer => designer?.name)
+        .sort((left, right) => (right.projects?.length ?? 0) - (left.projects?.length ?? 0))
+        .slice(0, 3)
+        .map(designer => ({
+          name: designer.name,
+          specialties: designer.specialties?.length ? designer.specialties : [designer.company?.name ?? 'Interior design'],
+          projectCount: designer.projects?.length ?? 0,
+          imageUrl: designer.company?.logo_url
+        }));
+      if (rankedDesigners.length) featuredDesigners = rankedDesigners;
+    } catch (error) {
+      console.warn('Could not load featured designers:', error);
+    }
+    const designerCards = featuredDesigners.map((designer, index) => {
+      const specialty = Array.isArray(designer.specialties) && designer.specialties.length
+        ? designer.specialties.join(' · ')
+        : 'Interior design';
+      const projectCount = Number(designer.projectCount ?? 0);
+      const imageUrl = designer.imageUrl || designerPortraits[index % designerPortraits.length];
+      return `<article class="designer-card"><img class="designer-avatar" src="${esc(imageUrl)}" alt="${esc(designer.name)}" loading="lazy"><div><h3><a href="#home-search">${esc(designer.name)}</a></h3><p>${esc(specialty)}<br>${projectCount} ${projectCount === 1 ? 'project' : 'projects'}</p></div></article>`;
+    }).join('');
     this.show(`<div class="homepage">
       <section class="home-wrap home-hero">
         <div class="home-hero-copy">
@@ -888,12 +957,8 @@ class App {
         </div>
       </div></section>
       <section class="home-section" id="designers"><div class="home-wrap">
-        <div class="section-heading"><div><h2>Featured interior designers</h2><p class="section-subtitle">Meet the companies behind the projects.</p></div><a class="text-link" href="#home-search">View all →</a></div>
-        <div class="designer-grid">
-          <article class="designer-card"><span class="designer-avatar"></span><div><h3><a href="#home-search">Oakline Studio</a></h3><p>Scandinavian · residential<br>3 projects</p></div></article>
-          <article class="designer-card"><span class="designer-avatar"></span><div><h3><a href="#home-search">Brickhaus Interiors</a></h3><p>Industrial · commercial<br>4 projects</p></div></article>
-          <article class="designer-card"><span class="designer-avatar"></span><div><h3><a href="#home-search">Kin Design</a></h3><p>Japandi · landed homes<br>5 projects</p></div></article>
-        </div>
+        <div class="section-heading"><div><h2>Featured interior designers</h2><p class="section-subtitle">Meet the interior designers behind the projects.</p></div><a class="text-link" href="#home-search">View all →</a></div>
+        <div class="designer-grid">${designerCards}</div>
       </div></section>
       <section class="designer-cta"><div class="home-wrap"><div><h2>Are you an interior designer?</h2><p>Showcase your company and past projects, and see how many customers view and shortlist them.</p></div><button class="btn" type="button" data-action="designer-signup">Register as a designer</button></div></section>
       <footer class="site-footer"><span class="footer-brand">▣ CPU</span><span>About　 Contact　 Privacy</span><span>CSIT314 group project</span></footer>
@@ -960,10 +1025,18 @@ class App {
     this.show(`<section class="auth-page"><div class="auth-card ${mode === 'register' ? 'register-card' : ''}"><h2>${form.title}</h2><p class="auth-intro">${form.intro}</p>
       <div id="msg" class="auth-message" role="alert" aria-live="polite"></div>
       <form class="stack auth-form" id="f">${form.fields}<button class="btn auth-submit">${form.button}</button></form>
+      ${mode === 'login' ? '<p class="auth-switch"><a href="#" data-forgot-password>Forgot password?</a></p>' : ''}
       ${accountLinks}${mode === 'login' ? '<p class="auth-notice">If your account is suspended, please contact the platform administrator.</p>' : '<p class="auth-notice">Admin and Platform Management accounts are created by an administrator, not through this form.</p>'}</div></section>`);
     this.bindAuthHeader();
     this.$('#main').onclick = e => {
       if (e.target.closest('[data-m]')) { this.loginView(e.target.closest('[data-m]').dataset.m); return; }
+      if (e.target.closest('[data-forgot-password]')) {
+        e.preventDefault();
+        const message = this.$('#msg');
+        message.className = 'auth-message';
+        message.textContent = 'Contact a User Admin to reset your password. A User Admin can find your account under Accounts and choose Reset password.';
+        return;
+      }
       if (e.target.closest('[data-terms]')) { e.preventDefault(); this.$('#msg').textContent = 'Please contact the platform administrator for the current terms and privacy policy.'; this.$('#msg').className = 'auth-message'; }
     };
     if (mode === 'register') {
@@ -1208,7 +1281,10 @@ class App {
       const rows = await this.designers.findDesigners({ q: this.$('#q').value, cat: this.$('#cat').value, sort: this.$('#sort').value });
       this.$('#count').textContent = `${rows.length} ${rows.length === 1 ? 'designer' : 'designers'} found`;
       this.$('#res').innerHTML = rows.map((designer, index) => `<article class="finder-designer-card">
-        <div class="designer-cover cover-${index % 4}"><span>Cover placeholder</span><i aria-hidden="true"></i></div>
+        <div class="designer-cover cover-${index % 4}" ${designer.company?.cover_url ? `style="background-image:url('${esc(designer.company.cover_url)}');background-size:cover;background-position:center"` : ''}>
+          <span>${designer.company?.cover_url ? '' : 'Cover placeholder'}</span>
+          ${designer.company?.logo_url ? `<img src="${esc(designer.company.logo_url)}" alt="${esc(designer.company?.name ?? designer.name)} logo">` : '<i aria-hidden="true"></i>'}
+        </div>
         <div class="finder-designer-info"><h2>${esc(designer.company?.name ?? designer.name)}</h2>
           <div class="designer-specialties">${designer.specialties.map(specialty => `<span>${esc(specialty)}</span>`).join('') || '<span>Interior design</span>'}</div>
           <p>${designer.projects.length} ${designer.projects.length === 1 ? 'project' : 'projects'} · ${designer.totalViews.toLocaleString()} total views</p>
@@ -1532,6 +1608,7 @@ class App {
           <article class="idp-most-viewed"><div><strong id="category-most-viewed-name">${esc(topCategory?.name ?? '—')}</strong><span id="category-most-viewed-views">${Number(topCategory?.views ?? 0).toLocaleString()} views</span></div><div class="meta">Most viewed</div></article>
         </div>
         <p id="analytics-live-status" class="idp-note" aria-live="polite">Connecting to live updates…</p>
+        <p id="category-operation-status" class="idp-note" aria-live="polite" hidden></p>
         <section class="idp-table-card">
           <h2>All categories</h2>
           <table class="idp-table">
@@ -1565,11 +1642,6 @@ class App {
             <button type="button" class="account-modal-close" id="close-category-delete" aria-label="Close dialog">×</button>
           </div>
           <p class="category-delete-copy" id="category-delete-copy">Checking category usage…</p>
-          <label id="category-move-field" hidden>Move projects to
-            <select id="category-move-target" name="target" required disabled>
-              <option value="">Select a category</option>
-            </select>
-          </label>
           <p class="err category-delete-error" role="alert"></p>
           <div class="account-edit-actions">
             <button type="button" class="btn secondary-btn" id="cancel-category-delete">Cancel</button>
@@ -1604,89 +1676,41 @@ class App {
     const form = this.$('#category-form');
     const deleteDialog = this.$('#category-delete-dialog');
     const deleteForm = this.$('#category-delete-form');
-    const deleteTarget = this.$('#category-move-target');
-    const deleteButton = this.$('#confirm-category-delete');
-    let categoryToDelete = null;
-    let categoryUsage = null;
-    let deleteRequest = 0;
+    const projectCategory = new ProjectCategory(db);
+    const status = (kind, message) => {
+      const element = this.$('#category-operation-status');
+      if (!element) return;
+      element.className = kind === 'error' ? 'err' : 'idp-note';
+      element.textContent = message;
+      element.hidden = false;
+    };
+    const createUI = new CreateCategoryUI({
+      dialog, form, controller: new CreateCategoryController(projectCategory),
+      refresh: () => this.categoriesView(), status
+    });
+    const deleteUI = new DeleteCategoryUI({
+      dialog: deleteDialog, controller: new DeleteCategoryController(projectCategory),
+      projectCategory, refresh: () => this.categoriesView(), status
+    });
     const openDialog = category => {
+      if (!category) return createUI.selectCreateCategory();
       form.reset();
       this.$('.category-modal-error').textContent = '';
-      form.elements.namedItem('id').value = category?.id ?? '';
-      form.elements.namedItem('name').value = category?.name ?? '';
-      form.elements.namedItem('description').value = category?.description ?? '';
-      this.$('#category-dialog-title').textContent = category ? 'Edit category' : 'Add category';
-      this.$('#save-category').textContent = category ? 'Save changes' : 'Add category';
-      this.$('#category-modal-note').textContent = category
-        ? `Renaming updates this category on all ${category.projects} projects.`
-        : 'This category will be available when customers search for projects.';
+      form.elements.namedItem('id').value = category.id;
+      form.elements.namedItem('name').value = category.name;
+      form.elements.namedItem('description').value = category.description ?? '';
+      this.$('#category-dialog-title').textContent = 'Edit category';
+      this.$('#save-category').textContent = 'Save changes';
+      this.$('#category-modal-note').textContent = `Renaming updates this category on all ${category.projects} projects.`;
       dialog.showModal();
       form.elements.namedItem('name').focus();
-    };
-    const openDeleteDialog = async category => {
-      const request = ++deleteRequest;
-      categoryToDelete = category;
-      categoryUsage = null;
-      deleteForm.reset();
-      this.$('#category-delete-title').textContent = `Delete “${category.name}”?`;
-      this.$('#category-delete-copy').textContent = 'Checking category usage…';
-      this.$('.category-delete-error').textContent = '';
-      this.$('#category-move-field').hidden = true;
-      deleteTarget.disabled = true;
-      deleteTarget.required = false;
-      deleteButton.disabled = true;
-      deleteDialog.showModal();
-      try {
-        const [usage] = await this.designers.categoryUsage(category.id);
-        if (request !== deleteRequest) return;
-        if (!usage) throw new Error('Could not find category usage information.');
-        const projectCount = Number(usage.project_count);
-        const draftCount = Number(usage.draft_count);
-        if (!Number.isSafeInteger(projectCount) || !Number.isSafeInteger(draftCount)) {
-          throw new Error('Category usage information is invalid.');
-        }
-        categoryUsage = { projectCount, draftCount };
-        const usageParts = [];
-        if (projectCount) usageParts.push(`${projectCount} ${projectCount === 1 ? 'project' : 'projects'}`);
-        if (draftCount) usageParts.push(`${draftCount} saved ${draftCount === 1 ? 'draft' : 'drafts'}`);
-        this.$('#category-delete-copy').textContent = usageParts.length
-          ? `${usageParts.join(' and ')} use this category. Move them to another category before deleting. This cannot be undone.`
-          : 'No projects use this category. This cannot be undone.';
-
-        if (usageParts.length) {
-          const otherCategories = rows.filter(row => String(row.id) !== String(category.id));
-          this.$('#category-move-field').hidden = false;
-          deleteTarget.innerHTML = `<option value="">Select a category</option>${otherCategories.map(row => `<option value="${esc(row.id)}">${esc(row.name)}</option>`).join('')}`;
-          deleteTarget.disabled = otherCategories.length === 0;
-          deleteTarget.required = otherCategories.length > 0;
-          deleteButton.disabled = otherCategories.length === 0;
-          if (otherCategories.length === 0) {
-            this.$('.category-delete-error').textContent = 'Create another category before deleting this one.';
-          }
-        } else {
-          deleteTarget.innerHTML = '<option value="">Select a category</option>';
-          deleteButton.disabled = false;
-        }
-      } catch (error) {
-        if (request !== deleteRequest) return;
-        this.$('#category-delete-copy').textContent = 'Category usage could not be checked. Try again.';
-        const missingFunction = error.code === 'PGRST202' ||
-          error.message.includes('platform_category_usage');
-        this.$('.category-delete-error').textContent = missingFunction
-          ? 'Apply the Platform category reassignment and safe-delete migration in schema.sql to the Supabase project configured in config.js, then refresh the API schema cache.'
-          : error.message;
-      }
     };
     this.$('#add-category').onclick = () => openDialog(null);
     this.$('#close-category-dialog').onclick = () => dialog.close();
     this.$('#cancel-category-dialog').onclick = () => dialog.close();
-    this.$('#close-category-delete').onclick = () => deleteDialog.close();
-    this.$('#cancel-category-delete').onclick = () => deleteDialog.close();
-    deleteDialog.onclose = () => { deleteRequest += 1; };
-    deleteTarget.onchange = () => {
-      deleteButton.disabled = !categoryUsage ||
-        (categoryUsage.projectCount + categoryUsage.draftCount > 0 && !deleteTarget.value);
-    };
+    this.$('#close-category-delete').onclick = () => deleteUI.cancelDeletion();
+    this.$('#cancel-category-delete').onclick = () => deleteUI.cancelDeletion();
+    deleteDialog.onclose = () => { deleteUI.requestId++; };
     this.$('.idp-table').onclick = e => {
       const edit = e.target.closest('[data-edit-category]');
       if (edit) openDialog(rows.find(row => String(row.id) === edit.dataset.editCategory));
@@ -1697,7 +1721,7 @@ class App {
       this.$('.category-page-error').textContent = '';
       const category = rows.find(row => String(row.id) === deleteButton.dataset.deleteCategory);
       if (!category) throw new Error('This category is no longer available.');
-      await openDeleteDialog(category);
+      await deleteUI.selectDeleteCategory(category.id, category.name);
     });
     dialog.onclick = e => {
       if (e.target === dialog) dialog.close();
@@ -1706,18 +1730,7 @@ class App {
       if (e.target === deleteDialog) deleteDialog.close();
     };
     deleteForm.onsubmit = this.guard(async () => {
-      if (!categoryToDelete || !categoryUsage) throw new Error('Category usage has not been checked.');
-      const hasReferences = categoryUsage.projectCount + categoryUsage.draftCount > 0;
-      const targetId = hasReferences ? deleteTarget.value : null;
-      if (hasReferences && !targetId) throw new Error('Select a category to move the projects to.');
-      deleteButton.disabled = true;
-      try {
-        await this.designers.moveAndDeleteCategory(categoryToDelete.id, targetId);
-        deleteDialog.close();
-        await this.categoriesView();
-      } finally {
-        deleteButton.disabled = false;
-      }
+      await deleteUI.confirmDeletion();
     });
     form.onsubmit = this.guard(async () => {
       const id = form.elements.namedItem('id').value;
@@ -1725,11 +1738,14 @@ class App {
         name: form.elements.namedItem('name').value.trim(),
         description: form.elements.namedItem('description').value.trim() || null
       };
-      if (!fields.name) throw new Error('Enter a category name.');
-      if (id) await this.designers.updateCategory(id, fields);
-      else await this.designers.createCategory(fields);
-      dialog.close();
-      await this.categoriesView();
+      if (id) {
+        if (!fields.name) throw new Error('Enter a category name.');
+        await this.designers.updateCategory(id, fields);
+        dialog.close();
+        await this.categoriesView();
+      } else {
+        await createUI.submitCategory(form.elements.namedItem('name').value, fields.description);
+      }
     });
   }
 
@@ -2962,6 +2978,7 @@ class App {
           website: String(values.get('website') ?? '').trim() || null,
           address: String(values.get('address') ?? '').trim() || null,
         }, logoInput.files?.[0] ?? null, coverInput.files?.[0] ?? null);
+        this.showToast('Company details saved.');
         await this.companyInformationView();
         if (warning) this.$('.designer-company-error').textContent = warning;
       } catch (error) {
@@ -3449,6 +3466,15 @@ class App {
           <div class="account-edit-actions"><button type="button" class="btn secondary-btn" id="cancel-edit-account">Cancel</button><button type="submit" class="btn">Save changes</button></div>
         </form>
       </dialog>
+      <dialog class="account-edit-dialog" id="reset-password-dialog" aria-labelledby="reset-password-title">
+        <form id="reset-password-form"><div class="account-edit-heading"><h2 id="reset-password-title">Reset password</h2><button type="button" class="account-modal-close" data-close-dialog="reset-password-dialog" aria-label="Close">×</button></div>
+          <p class="account-confirm-copy" id="reset-password-copy"></p>
+          <label>New password<input name="password" type="password" minlength="6" autocomplete="new-password" required></label>
+          <label>Confirm new password<input name="confirmPassword" type="password" minlength="6" autocomplete="new-password" required></label>
+          <p class="account-edit-error err" role="alert"></p>
+          <div class="account-edit-actions"><button type="button" class="btn secondary-btn" data-close-dialog="reset-password-dialog">Cancel</button><button type="submit" class="btn">Reset password</button></div>
+        </form>
+      </dialog>
       <dialog class="account-edit-dialog account-confirm-dialog" id="suspend-account-dialog" aria-labelledby="suspend-account-title">
         <form id="suspend-account-form"><div class="account-edit-heading"><h2 id="suspend-account-title">Suspend account</h2><button type="button" class="account-modal-close" data-close-dialog="suspend-account-dialog" aria-label="Close">×</button></div>
           <p class="account-confirm-copy" id="suspend-account-copy"></p>
@@ -3470,6 +3496,8 @@ class App {
     const createForm = this.$('#create-account-form');
     const editDialog = this.$('#edit-account-dialog');
     const editForm = this.$('#edit-account-form');
+    const resetDialog = this.$('#reset-password-dialog');
+    const resetForm = this.$('#reset-password-form');
     const suspendDialog = this.$('#suspend-account-dialog');
     const suspendForm = this.$('#suspend-account-form');
     const deleteDialog = this.$('#delete-account-dialog');
@@ -3491,6 +3519,7 @@ class App {
         <td><strong>${esc(user.name)}</strong></td><td>${esc(user.email || '—')}</td><td>${profileLabels[user.role] ?? esc(user.role)}</td>
         <td><span class="account-status ${user.status === 'suspended' ? 'suspended' : 'active'}">${user.status === 'suspended' ? 'Suspended' : 'Active'}</span></td>
         <td><div class="account-row-actions"><button class="btn secondary-btn" data-a="edit" data-id="${user.id}" data-n="${esc(user.name)}" data-email="${esc(user.email)}" data-role="${esc(user.role)}" data-s="${esc(user.status)}">Edit</button>
+          <button class="btn secondary-btn" data-a="pw" data-id="${user.id}" data-n="${esc(user.name)}">Reset password</button>
           <button class="btn secondary-btn" data-a="sus" data-id="${user.id}" data-n="${esc(user.name)}" data-s="${user.status}">${user.status === 'active' ? 'Suspend' : 'Reactivate'}</button>
           <button class="btn secondary-btn" data-a="del" data-id="${user.id}" data-n="${esc(user.name)}">Delete</button></div></td></tr>`).join('') || '<tr><td colspan="5" class="accounts-empty">No accounts match your filters.</td></tr>';
       const start = total ? page * pageSize + 1 : 0;
@@ -3540,11 +3569,12 @@ class App {
     this.$$('.account-modal-close,[data-close-dialog]').forEach(button => {
       button.onclick = () => closeDialog(this.$(`#${button.dataset.closeDialog ?? button.closest('dialog').id}`));
     });
+    resetDialog.addEventListener('close', () => resetForm.reset());
     createDialog.addEventListener('close', () => {
       createForm.reset();
       createForm.elements.invite.onchange();
     });
-    [createDialog, editDialog, suspendDialog, deleteDialog].forEach(dialog => {
+    [createDialog, editDialog, resetDialog, suspendDialog, deleteDialog].forEach(dialog => {
       dialog.onclick = e => { if (e.target === dialog) closeDialog(dialog); };
     });
     const closeEditDialog = () => closeDialog(editDialog);
@@ -3576,6 +3606,13 @@ class App {
         editForm.elements.role.value = role;
         editForm.elements.status.value = s;
         editDialog.showModal();
+        return;
+      }
+      if (a === 'pw') {
+        selectedAccount = { id, name: n };
+        this.$('#reset-password-copy').textContent = `Set a new password for ${n}. Share it with the account owner securely.`;
+        resetForm.reset();
+        resetDialog.showModal();
         return;
       }
       selectedAccount = { id, name: n };
