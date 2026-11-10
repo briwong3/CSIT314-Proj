@@ -538,8 +538,15 @@ class App {
       ? ''
       : this.user
         ? tabs.map(t => `<button data-t="${t}" class="${t === this.tab ? 'on' : ''}">${this.labels[t]}</button>`).join('')
-        : '<a href="#featured">Browse projects</a><a href="#designers">Find a designer</a><span class="nav-coming-soon" aria-disabled="true" title="Favourites page coming soon">Favourites</span>';
-    this.$('#nav').onclick = e => e.target.dataset.t && this.open(e.target.dataset.t);
+        : '<a href="#featured">Browse projects</a><a href="#designers">Find a designer</a><a href="#" data-m="login">Favourites</a>';
+    this.$('#nav').onclick = e => {
+      const link = e.target.closest('[data-m], [data-t]');
+      if (!link) return;
+      if (link.dataset.m) {
+        e.preventDefault();
+        this.loginView(link.dataset.m);
+      } else this.open(link.dataset.t);
+    };
     this.$('#who').innerHTML = this.user
       ? `<div class="notification-control"><button type="button" class="notification-bell" id="notification-bell" aria-label="Notifications" aria-expanded="false" title="Notifications"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9"/><path d="M10 21h4"/></svg><span class="notification-count" id="notification-count" hidden></span></button></div>${this.user.role === 'admin' ? `<label class="view-as-control"><span>View as</span><select id="view-as" aria-label="View as role"><option value="admin" ${this.viewAs === null ? 'selected' : ''}>User Admin</option><option value="customer" ${this.viewAs === 'customer' ? 'selected' : ''}>Customer</option><option value="designer" ${this.viewAs === 'designer' ? 'selected' : ''}>Interior Designer</option></select></label>` : ''}<button class="account-link" id="account-link" title="${this.isReadOnlyPreview ? 'Signed in as User Admin' : 'My account'}" ${this.isReadOnlyPreview ? 'disabled' : ''}>${esc(this.user.name)}${this.isReadOnlyPreview ? ' (User Admin)' : ''}</button><button class="logout-link" id="out">Log out</button>`
       : '<button class="btn" data-m="login">Log in</button><button class="btn" data-m="register">Sign up</button>';
@@ -876,6 +883,11 @@ class App {
   }
 
   async homeView() {
+    const designerPortraits = [
+      'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=160&h=160&q=80',
+      'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?auto=format&fit=crop&w=160&h=160&q=80',
+      'https://images.unsplash.com/photo-1531123897727-8f129e1688ce?auto=format&fit=crop&w=160&h=160&q=80'
+    ];
     const fallbackDesigners = [
       { name: 'Olivia Hart', specialties: ['Scandinavian · residential'], projectCount: 3 },
       { name: 'Daniel Brooks', specialties: ['Industrial · commercial'], projectCount: 4 },
@@ -891,18 +903,20 @@ class App {
         .map(designer => ({
           name: designer.name,
           specialties: designer.specialties?.length ? designer.specialties : [designer.company?.name ?? 'Interior design'],
-          projectCount: designer.projects?.length ?? 0
+          projectCount: designer.projects?.length ?? 0,
+          imageUrl: designer.company?.logo_url
         }));
       if (rankedDesigners.length) featuredDesigners = rankedDesigners;
     } catch (error) {
       console.warn('Could not load featured designers:', error);
     }
-    const designerCards = featuredDesigners.map(designer => {
+    const designerCards = featuredDesigners.map((designer, index) => {
       const specialty = Array.isArray(designer.specialties) && designer.specialties.length
         ? designer.specialties.join(' · ')
         : 'Interior design';
       const projectCount = Number(designer.projectCount ?? 0);
-      return `<article class="designer-card"><span class="designer-avatar"></span><div><h3><a href="#home-search">${esc(designer.name)}</a></h3><p>${esc(specialty)}<br>${projectCount} ${projectCount === 1 ? 'project' : 'projects'}</p></div></article>`;
+      const imageUrl = designer.imageUrl || designerPortraits[index % designerPortraits.length];
+      return `<article class="designer-card"><img class="designer-avatar" src="${esc(imageUrl)}" alt="${esc(designer.name)}" loading="lazy"><div><h3><a href="#home-search">${esc(designer.name)}</a></h3><p>${esc(specialty)}<br>${projectCount} ${projectCount === 1 ? 'project' : 'projects'}</p></div></article>`;
     }).join('');
     this.show(`<div class="homepage">
       <section class="home-wrap home-hero">
@@ -1594,6 +1608,7 @@ class App {
           <article class="idp-most-viewed"><div><strong id="category-most-viewed-name">${esc(topCategory?.name ?? '—')}</strong><span id="category-most-viewed-views">${Number(topCategory?.views ?? 0).toLocaleString()} views</span></div><div class="meta">Most viewed</div></article>
         </div>
         <p id="analytics-live-status" class="idp-note" aria-live="polite">Connecting to live updates…</p>
+        <p id="category-operation-status" class="idp-note" aria-live="polite" hidden></p>
         <section class="idp-table-card">
           <h2>All categories</h2>
           <table class="idp-table">
@@ -1627,11 +1642,6 @@ class App {
             <button type="button" class="account-modal-close" id="close-category-delete" aria-label="Close dialog">×</button>
           </div>
           <p class="category-delete-copy" id="category-delete-copy">Checking category usage…</p>
-          <label id="category-move-field" hidden>Move projects to
-            <select id="category-move-target" name="target" required disabled>
-              <option value="">Select a category</option>
-            </select>
-          </label>
           <p class="err category-delete-error" role="alert"></p>
           <div class="account-edit-actions">
             <button type="button" class="btn secondary-btn" id="cancel-category-delete">Cancel</button>
@@ -1666,89 +1676,41 @@ class App {
     const form = this.$('#category-form');
     const deleteDialog = this.$('#category-delete-dialog');
     const deleteForm = this.$('#category-delete-form');
-    const deleteTarget = this.$('#category-move-target');
-    const deleteButton = this.$('#confirm-category-delete');
-    let categoryToDelete = null;
-    let categoryUsage = null;
-    let deleteRequest = 0;
+    const projectCategory = new ProjectCategory(db);
+    const status = (kind, message) => {
+      const element = this.$('#category-operation-status');
+      if (!element) return;
+      element.className = kind === 'error' ? 'err' : 'idp-note';
+      element.textContent = message;
+      element.hidden = false;
+    };
+    const createUI = new CreateCategoryUI({
+      dialog, form, controller: new CreateCategoryController(projectCategory),
+      refresh: () => this.categoriesView(), status
+    });
+    const deleteUI = new DeleteCategoryUI({
+      dialog: deleteDialog, controller: new DeleteCategoryController(projectCategory),
+      projectCategory, refresh: () => this.categoriesView(), status
+    });
     const openDialog = category => {
+      if (!category) return createUI.selectCreateCategory();
       form.reset();
       this.$('.category-modal-error').textContent = '';
-      form.elements.namedItem('id').value = category?.id ?? '';
-      form.elements.namedItem('name').value = category?.name ?? '';
-      form.elements.namedItem('description').value = category?.description ?? '';
-      this.$('#category-dialog-title').textContent = category ? 'Edit category' : 'Add category';
-      this.$('#save-category').textContent = category ? 'Save changes' : 'Add category';
-      this.$('#category-modal-note').textContent = category
-        ? `Renaming updates this category on all ${category.projects} projects.`
-        : 'This category will be available when customers search for projects.';
+      form.elements.namedItem('id').value = category.id;
+      form.elements.namedItem('name').value = category.name;
+      form.elements.namedItem('description').value = category.description ?? '';
+      this.$('#category-dialog-title').textContent = 'Edit category';
+      this.$('#save-category').textContent = 'Save changes';
+      this.$('#category-modal-note').textContent = `Renaming updates this category on all ${category.projects} projects.`;
       dialog.showModal();
       form.elements.namedItem('name').focus();
-    };
-    const openDeleteDialog = async category => {
-      const request = ++deleteRequest;
-      categoryToDelete = category;
-      categoryUsage = null;
-      deleteForm.reset();
-      this.$('#category-delete-title').textContent = `Delete “${category.name}”?`;
-      this.$('#category-delete-copy').textContent = 'Checking category usage…';
-      this.$('.category-delete-error').textContent = '';
-      this.$('#category-move-field').hidden = true;
-      deleteTarget.disabled = true;
-      deleteTarget.required = false;
-      deleteButton.disabled = true;
-      deleteDialog.showModal();
-      try {
-        const [usage] = await this.designers.categoryUsage(category.id);
-        if (request !== deleteRequest) return;
-        if (!usage) throw new Error('Could not find category usage information.');
-        const projectCount = Number(usage.project_count);
-        const draftCount = Number(usage.draft_count);
-        if (!Number.isSafeInteger(projectCount) || !Number.isSafeInteger(draftCount)) {
-          throw new Error('Category usage information is invalid.');
-        }
-        categoryUsage = { projectCount, draftCount };
-        const usageParts = [];
-        if (projectCount) usageParts.push(`${projectCount} ${projectCount === 1 ? 'project' : 'projects'}`);
-        if (draftCount) usageParts.push(`${draftCount} saved ${draftCount === 1 ? 'draft' : 'drafts'}`);
-        this.$('#category-delete-copy').textContent = usageParts.length
-          ? `${usageParts.join(' and ')} use this category. Move them to another category before deleting. This cannot be undone.`
-          : 'No projects use this category. This cannot be undone.';
-
-        if (usageParts.length) {
-          const otherCategories = rows.filter(row => String(row.id) !== String(category.id));
-          this.$('#category-move-field').hidden = false;
-          deleteTarget.innerHTML = `<option value="">Select a category</option>${otherCategories.map(row => `<option value="${esc(row.id)}">${esc(row.name)}</option>`).join('')}`;
-          deleteTarget.disabled = otherCategories.length === 0;
-          deleteTarget.required = otherCategories.length > 0;
-          deleteButton.disabled = otherCategories.length === 0;
-          if (otherCategories.length === 0) {
-            this.$('.category-delete-error').textContent = 'Create another category before deleting this one.';
-          }
-        } else {
-          deleteTarget.innerHTML = '<option value="">Select a category</option>';
-          deleteButton.disabled = false;
-        }
-      } catch (error) {
-        if (request !== deleteRequest) return;
-        this.$('#category-delete-copy').textContent = 'Category usage could not be checked. Try again.';
-        const missingFunction = error.code === 'PGRST202' ||
-          error.message.includes('platform_category_usage');
-        this.$('.category-delete-error').textContent = missingFunction
-          ? 'Apply the Platform category reassignment and safe-delete migration in schema.sql to the Supabase project configured in config.js, then refresh the API schema cache.'
-          : error.message;
-      }
     };
     this.$('#add-category').onclick = () => openDialog(null);
     this.$('#close-category-dialog').onclick = () => dialog.close();
     this.$('#cancel-category-dialog').onclick = () => dialog.close();
-    this.$('#close-category-delete').onclick = () => deleteDialog.close();
-    this.$('#cancel-category-delete').onclick = () => deleteDialog.close();
-    deleteDialog.onclose = () => { deleteRequest += 1; };
-    deleteTarget.onchange = () => {
-      deleteButton.disabled = !categoryUsage ||
-        (categoryUsage.projectCount + categoryUsage.draftCount > 0 && !deleteTarget.value);
-    };
+    this.$('#close-category-delete').onclick = () => deleteUI.cancelDeletion();
+    this.$('#cancel-category-delete').onclick = () => deleteUI.cancelDeletion();
+    deleteDialog.onclose = () => { deleteUI.requestId++; };
     this.$('.idp-table').onclick = e => {
       const edit = e.target.closest('[data-edit-category]');
       if (edit) openDialog(rows.find(row => String(row.id) === edit.dataset.editCategory));
@@ -1759,7 +1721,7 @@ class App {
       this.$('.category-page-error').textContent = '';
       const category = rows.find(row => String(row.id) === deleteButton.dataset.deleteCategory);
       if (!category) throw new Error('This category is no longer available.');
-      await openDeleteDialog(category);
+      await deleteUI.selectDeleteCategory(category.id, category.name);
     });
     dialog.onclick = e => {
       if (e.target === dialog) dialog.close();
@@ -1768,18 +1730,7 @@ class App {
       if (e.target === deleteDialog) deleteDialog.close();
     };
     deleteForm.onsubmit = this.guard(async () => {
-      if (!categoryToDelete || !categoryUsage) throw new Error('Category usage has not been checked.');
-      const hasReferences = categoryUsage.projectCount + categoryUsage.draftCount > 0;
-      const targetId = hasReferences ? deleteTarget.value : null;
-      if (hasReferences && !targetId) throw new Error('Select a category to move the projects to.');
-      deleteButton.disabled = true;
-      try {
-        await this.designers.moveAndDeleteCategory(categoryToDelete.id, targetId);
-        deleteDialog.close();
-        await this.categoriesView();
-      } finally {
-        deleteButton.disabled = false;
-      }
+      await deleteUI.confirmDeletion();
     });
     form.onsubmit = this.guard(async () => {
       const id = form.elements.namedItem('id').value;
@@ -1787,11 +1738,14 @@ class App {
         name: form.elements.namedItem('name').value.trim(),
         description: form.elements.namedItem('description').value.trim() || null
       };
-      if (!fields.name) throw new Error('Enter a category name.');
-      if (id) await this.designers.updateCategory(id, fields);
-      else await this.designers.createCategory(fields);
-      dialog.close();
-      await this.categoriesView();
+      if (id) {
+        if (!fields.name) throw new Error('Enter a category name.');
+        await this.designers.updateCategory(id, fields);
+        dialog.close();
+        await this.categoriesView();
+      } else {
+        await createUI.submitCategory(form.elements.namedItem('name').value, fields.description);
+      }
     });
   }
 
