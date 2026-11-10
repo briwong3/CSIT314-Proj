@@ -63,6 +63,22 @@ class AccountController {
       if (result.user?.email === email) must(await db.from('profiles').update({ email }).eq('id', id));
       return result;
     });
+    resetForm.onsubmit = this.guard(async e => {
+      const values = new FormData(e.currentTarget);
+      const password = String(values.get('password') ?? '');
+      if (password.length < 6) throw new Error('The password must be at least 6 characters.');
+      if (password !== values.get('confirmPassword')) throw new Error('The passwords do not match.');
+      const submit = resetForm.querySelector('[type="submit"]');
+      submit.disabled = true;
+      try {
+        await this.admin.resetPassword(selectedAccount.id, password);
+        closeDialog(resetDialog);
+        resetForm.reset();
+        this.ok(`Password reset for ${selectedAccount.name}.`);
+      } finally {
+        submit.disabled = false;
+      }
+    });
   }
   async changePassword(email, currentPassword, password) {
     must(await db.auth.signInWithPassword({ email, password: currentPassword }));
@@ -470,6 +486,7 @@ class App {
   $$ = s => document.querySelectorAll(s);
   labels = { dashboard: 'Dashboard', categories: 'IDP categories', accounts: 'Accounts', profiles: 'User profiles', projects: 'Browse projects', designers: 'Find a designer', favorites: 'Favourites', messages: 'Direct messages', account: 'My account', users: 'Users', logs: 'Audit log', notifications: 'Notifications' };
   get isReadOnlyPreview() { return this.user?.role === 'admin' && this.viewAs !== null; }
+  get isCustomerPreview() { return this.user?.role === 'admin' && this.viewAs === 'customer'; }
   get designerDashboardUserId() { return this.viewAs === 'designer' ? this.previewDesignerId : this.user.id; }
   get canUseDirectMessages() { return ['customer', 'designer'].includes(this.user?.role) && !this.isReadOnlyPreview; }
 
@@ -520,7 +537,7 @@ class App {
     this.$('#nav').innerHTML = this.user?.role === 'platform'
       ? ''
       : this.user
-        ? tabs.map(t => `<button data-t="${t}" class="${t === this.tab ? 'on' : ''}"${t === 'favorites' && this.isReadOnlyPreview ? ' disabled title="Favourites are switched off in preview mode"' : ''}>${this.labels[t]}</button>`).join('')
+        ? tabs.map(t => `<button data-t="${t}" class="${t === this.tab ? 'on' : ''}">${this.labels[t]}</button>`).join('')
         : '<a href="#featured">Browse projects</a><a href="#designers">Find a designer</a><span class="nav-coming-soon" aria-disabled="true" title="Favourites page coming soon">Favourites</span>';
     this.$('#nav').onclick = e => e.target.dataset.t && this.open(e.target.dataset.t);
     this.$('#who').innerHTML = this.user
@@ -571,9 +588,9 @@ class App {
     this.homeView();
   }
   async open(t, ...args) {
-    if (this.isReadOnlyPreview && (this.viewAs === 'designer' ? t !== 'dashboard' : !['projects', 'designers'].includes(t))) return;
+    if (this.isReadOnlyPreview && (this.viewAs === 'designer' ? t !== 'dashboard' : !['projects', 'designers', 'favorites'].includes(t))) return;
     if (t === 'messages' && !this.canUseDirectMessages) return;
-    if (t === 'favorites' && (this.user?.role !== 'customer' || this.isReadOnlyPreview)) return;
+    if (t === 'favorites' && this.user?.role !== 'customer' && !this.isCustomerPreview) return;
     if (['categories', 'verification', 'feedback', 'dailyReport', 'weeklyReport', 'monthlyReport'].includes(t) && this.user?.role !== 'platform') return;
     this.tab = t;
     this.shell();
@@ -757,12 +774,14 @@ class App {
   }
   favoriteLabel(saved) { return saved ? 'Remove from favourites' : 'Add to favourites'; }
   favoriteButton(projectId, labelled = false) {
-    if (!this.canFavorite || !this.favoritesAvailable) return '';
+    const previewOnly = this.isCustomerPreview;
+    if ((!this.canFavorite && !previewOnly) || (!this.favoritesAvailable && !previewOnly)) return '';
     const id = Number(projectId);
     const saved = this.favoriteIds.has(id);
     const label = this.favoriteLabel(saved);
     const heart = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20.5s-7.5-4.6-9.6-9.2C.9 7.8 3 4 6.6 4c2 0 3.7 1.1 5.4 3 1.7-1.9 3.4-3 5.4-3 3.6 0 5.7 3.8 4.2 7.3-2.1 4.6-9.6 9.2-9.6 9.2z"/></svg>';
-    return `<button type="button" class="fav-btn${labelled ? ' fav-btn-labelled' : ''}${saved ? ' on' : ''}" data-fav="${id}" aria-pressed="${saved}" aria-label="${label}" title="${label}">${heart}${labelled ? `<span class="fav-text">${label}</span>` : ''}</button>`;
+    const previewLabel = 'Favourites are read-only in customer preview';
+    return `<button type="button" class="fav-btn${labelled ? ' fav-btn-labelled' : ''}${saved ? ' on' : ''}" data-fav="${id}" aria-pressed="${saved}" aria-label="${previewOnly ? previewLabel : label}" title="${previewOnly ? previewLabel : label}" ${previewOnly ? 'disabled' : ''}>${heart}${labelled ? `<span class="fav-text">${previewOnly ? 'Read-only preview' : label}</span>` : ''}</button>`;
   }
   setFavoriteButton(button, saved) {
     const label = this.favoriteLabel(saved);
@@ -808,6 +827,14 @@ class App {
     setTimeout(() => toast.remove(), 9000);
   }
   async favoritesView() {
+    if (this.isCustomerPreview) {
+      this.show(`<section class="project-browser"><h1>Favourites</h1><p class="finder-intro">Your saved projects will appear here.</p>
+        <div class="project-browser-grid"><div class="project-empty-state"><h2>Read-only customer preview</h2>
+          <p>Saved projects are only available when signed in as a customer.</p>
+          <button class="btn" type="button" id="browse-projects">Browse projects</button></div></div></section>`);
+      this.$('#browse-projects').onclick = () => this.open('projects');
+      return;
+    }
     this.show(`<section class="project-browser"><h1>Favourites</h1><p class="finder-intro">Projects you have saved. Open one to see its details, or remove it from your list.</p>
       <p class="results-count" id="count"></p><div id="res" class="project-browser-grid"></div><p id="msg" class="err" role="alert"></p></section>`);
     const result = await Promise.allSettled([this.loadFavoriteIds(), this.favorites.list()]);
@@ -984,10 +1011,18 @@ class App {
     this.show(`<section class="auth-page"><div class="auth-card ${mode === 'register' ? 'register-card' : ''}"><h2>${form.title}</h2><p class="auth-intro">${form.intro}</p>
       <div id="msg" class="auth-message" role="alert" aria-live="polite"></div>
       <form class="stack auth-form" id="f">${form.fields}<button class="btn auth-submit">${form.button}</button></form>
+      ${mode === 'login' ? '<p class="auth-switch"><a href="#" data-forgot-password>Forgot password?</a></p>' : ''}
       ${accountLinks}${mode === 'login' ? '<p class="auth-notice">If your account is suspended, please contact the platform administrator.</p>' : '<p class="auth-notice">Admin and Platform Management accounts are created by an administrator, not through this form.</p>'}</div></section>`);
     this.bindAuthHeader();
     this.$('#main').onclick = e => {
       if (e.target.closest('[data-m]')) { this.loginView(e.target.closest('[data-m]').dataset.m); return; }
+      if (e.target.closest('[data-forgot-password]')) {
+        e.preventDefault();
+        const message = this.$('#msg');
+        message.className = 'auth-message';
+        message.textContent = 'Contact a User Admin to reset your password. A User Admin can find your account under Accounts and choose Reset password.';
+        return;
+      }
       if (e.target.closest('[data-terms]')) { e.preventDefault(); this.$('#msg').textContent = 'Please contact the platform administrator for the current terms and privacy policy.'; this.$('#msg').className = 'auth-message'; }
     };
     if (mode === 'register') {
@@ -3477,6 +3512,15 @@ class App {
           <div class="account-edit-actions"><button type="button" class="btn secondary-btn" id="cancel-edit-account">Cancel</button><button type="submit" class="btn">Save changes</button></div>
         </form>
       </dialog>
+      <dialog class="account-edit-dialog" id="reset-password-dialog" aria-labelledby="reset-password-title">
+        <form id="reset-password-form"><div class="account-edit-heading"><h2 id="reset-password-title">Reset password</h2><button type="button" class="account-modal-close" data-close-dialog="reset-password-dialog" aria-label="Close">×</button></div>
+          <p class="account-confirm-copy" id="reset-password-copy"></p>
+          <label>New password<input name="password" type="password" minlength="6" autocomplete="new-password" required></label>
+          <label>Confirm new password<input name="confirmPassword" type="password" minlength="6" autocomplete="new-password" required></label>
+          <p class="account-edit-error err" role="alert"></p>
+          <div class="account-edit-actions"><button type="button" class="btn secondary-btn" data-close-dialog="reset-password-dialog">Cancel</button><button type="submit" class="btn">Reset password</button></div>
+        </form>
+      </dialog>
       <dialog class="account-edit-dialog account-confirm-dialog" id="suspend-account-dialog" aria-labelledby="suspend-account-title">
         <form id="suspend-account-form"><div class="account-edit-heading"><h2 id="suspend-account-title">Suspend account</h2><button type="button" class="account-modal-close" data-close-dialog="suspend-account-dialog" aria-label="Close">×</button></div>
           <p class="account-confirm-copy" id="suspend-account-copy"></p>
@@ -3498,6 +3542,8 @@ class App {
     const createForm = this.$('#create-account-form');
     const editDialog = this.$('#edit-account-dialog');
     const editForm = this.$('#edit-account-form');
+    const resetDialog = this.$('#reset-password-dialog');
+    const resetForm = this.$('#reset-password-form');
     const suspendDialog = this.$('#suspend-account-dialog');
     const suspendForm = this.$('#suspend-account-form');
     const deleteDialog = this.$('#delete-account-dialog');
@@ -3519,6 +3565,7 @@ class App {
         <td><strong>${esc(user.name)}</strong></td><td>${esc(user.email || '—')}</td><td>${profileLabels[user.role] ?? esc(user.role)}</td>
         <td><span class="account-status ${user.status === 'suspended' ? 'suspended' : 'active'}">${user.status === 'suspended' ? 'Suspended' : 'Active'}</span></td>
         <td><div class="account-row-actions"><button class="btn secondary-btn" data-a="edit" data-id="${user.id}" data-n="${esc(user.name)}" data-email="${esc(user.email)}" data-role="${esc(user.role)}" data-s="${esc(user.status)}">Edit</button>
+          <button class="btn secondary-btn" data-a="pw" data-id="${user.id}" data-n="${esc(user.name)}">Reset password</button>
           <button class="btn secondary-btn" data-a="sus" data-id="${user.id}" data-n="${esc(user.name)}" data-s="${user.status}">${user.status === 'active' ? 'Suspend' : 'Reactivate'}</button>
           <button class="btn secondary-btn" data-a="del" data-id="${user.id}" data-n="${esc(user.name)}">Delete</button></div></td></tr>`).join('') || '<tr><td colspan="5" class="accounts-empty">No accounts match your filters.</td></tr>';
       const start = total ? page * pageSize + 1 : 0;
@@ -3568,11 +3615,12 @@ class App {
     this.$$('.account-modal-close,[data-close-dialog]').forEach(button => {
       button.onclick = () => closeDialog(this.$(`#${button.dataset.closeDialog ?? button.closest('dialog').id}`));
     });
+    resetDialog.addEventListener('close', () => resetForm.reset());
     createDialog.addEventListener('close', () => {
       createForm.reset();
       createForm.elements.invite.onchange();
     });
-    [createDialog, editDialog, suspendDialog, deleteDialog].forEach(dialog => {
+    [createDialog, editDialog, resetDialog, suspendDialog, deleteDialog].forEach(dialog => {
       dialog.onclick = e => { if (e.target === dialog) closeDialog(dialog); };
     });
     const closeEditDialog = () => closeDialog(editDialog);
@@ -3604,6 +3652,13 @@ class App {
         editForm.elements.role.value = role;
         editForm.elements.status.value = s;
         editDialog.showModal();
+        return;
+      }
+      if (a === 'pw') {
+        selectedAccount = { id, name: n };
+        this.$('#reset-password-copy').textContent = `Set a new password for ${n}. Share it with the account owner securely.`;
+        resetForm.reset();
+        resetDialog.showModal();
         return;
       }
       selectedAccount = { id, name: n };

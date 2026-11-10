@@ -138,13 +138,14 @@ button.notification-preview-item:hover{background:#eceef5}
 .notification-filters{display:flex;gap:8px;flex-wrap:wrap;margin:18px 0}
 .notification-filters button{padding:8px 14px;border:1px solid #cbd0dd;border-radius:99px;background:#fff;color:var(--navy);font:inherit;cursor:pointer}
 .notification-filters button.on{border-color:var(--ink);background:var(--ink);color:#fff}
-.notification-card{display:grid;grid-template-columns:10px minmax(0,1fr) auto;gap:10px;align-items:start;margin-bottom:14px;padding:16px;border:1px solid var(--line);border-radius:12px;background:#fff}
+.notification-card{display:flex;gap:10px;align-items:flex-start;margin-bottom:14px;padding:16px;border:1px solid var(--line);border-radius:12px;background:#fff}
 .notification-card.is-unread{border-left:3px solid var(--navy);background:#f8f9fc}
 .notification-card.is-read{background:#fff}
+.notification-card>div{flex:1;min-width:0}
 .notification-dot{width:9px;height:9px;margin-top:5px;border-radius:50%;background:var(--navy)}
 .notification-card>div strong{font-size:14px}
 .notification-card>div p{margin:4px 0 9px;color:#687087;font-size:13px}
-.notification-card time{color:#687087;font-size:11px;white-space:nowrap}
+.notification-card time{flex:none;color:#687087;font-size:11px;white-space:nowrap}
 .notification-card .btn{background:var(--navy);color:#fff;font-size:12px}
 .notification-card .secondary-btn{margin-left:6px;border:1px solid #cbd0dd;background:#fff;color:var(--navy)}
 .notification-card .secondary-btn:hover{background:#eef0f6}
@@ -171,7 +172,7 @@ button.notification-preview-item:hover{background:#eceef5}
 .platform-notifications-page .notification-filters button{padding:9px 16px}
 .platform-notifications-page .notification-card>div p{max-width:680px}
 @media(max-width:760px){.signed-in-header{flex-wrap:wrap;gap:10px;padding:10px 16px}.signed-in-header nav{order:3;flex-basis:100%;overflow:auto}.signed-in-header #who{margin-left:auto}.notification-popover{right:-126px}.messages-page{width:calc(100% - 28px);margin:20px auto 80px}.messages-layout{grid-template-columns:1fr}.conversation-panel{max-height:250px;overflow-y:auto}.message-thread{min-height:440px}.thread-messages{min-height:250px}.message-fab{right:16px;bottom:16px;width:52px;height:52px}}
-@media(max-width:760px){.signed-in-header{gap:10px;padding:10px 14px}.signed-in-header #who{gap:9px}.account-link{max-width:130px;overflow:hidden;text-overflow:ellipsis}.notification-popover{right:-126px}.notification-card{grid-template-columns:10px minmax(0,1fr)}.notification-card time{grid-column:2;grid-row:1;justify-self:start}.notifications-heading{align-items:flex-start;flex-direction:column}.notifications-page{width:calc(100% - 28px)}}
+@media(max-width:760px){.signed-in-header{gap:10px;padding:10px 14px}.signed-in-header #who{gap:9px}.account-link{max-width:130px;overflow:hidden;text-overflow:ellipsis}.notification-popover{right:-126px}.notification-card{flex-wrap:wrap}.notification-card .notification-dot{display:none}.notification-card>div{flex:1 1 100%}.notification-card time{flex:1 1 100%}.notifications-heading{align-items:flex-start;flex-direction:column}.notifications-page{width:calc(100% - 28px)}}
 @media(max-width:480px){header.auth-header{padding:0 20px}.auth-page{padding:28px 16px}.auth-card{padding:24px 20px}.signed-in-header b{font-size:16px}.signed-in-header #who{gap:7px}.notification-bell{width:36px;height:36px}.account-link{max-width:92px;padding:7px 10px;font-size:12px}.logout-link{font-size:12px}}
 main.project-detail-main{max-width:1240px;margin:20px auto;padding:0 24px}
 main.designer-profile-main{max-width:none;margin:0;padding:0}
