@@ -1,149 +1,78 @@
-# CPU Interior Designer CSIT314 Project
+# Introduction
+CPU is an interior designer platform, a web application built to connect clients with interior designers. Whether you are looking to transform a single room or manage a full-scale renovation, this platform provides a centralized space for browsing design portfolios, scheduling consultations, and managing projects from concept to completion.   
 
-A browser-based interior designer matching app using Supabase for authentication, database storage, row-level security, and an Edge Function for privileged account management.
 
-## Requirements
+## Key Features
 
-- A Supabase project
-- A modern browser
-- Python 3 (for the simple local web server below)
-- Supabase CLI (only needed to deploy the Edge Function)
+Portfolio Exploration: Customers can easily search and browse interior designer portfolios by project title or keywords to find the right style for their space.
 
-## 1. Connect the app to Supabase
+Appointment Scheduling: Booking and management system allowing designers to view, accept, decline, or reschedule customer consultations.
 
-1. In the Supabase Dashboard, open your project and go to **Project Settings → API**.
-2. Copy the **Project URL** and the **Publishable key** (or the legacy `anon` key).
-3. Open [`config.js`](./config.js) and set:
+Direct Messaging: Customers can message the interior designers that they wish to work on our website  without the hassle of calls and emails.
 
-   ```js
-   export const SUPABASE_URL = 'https://YOUR_PROJECT_REF.supabase.co';
-   export const SUPABASE_ANON_KEY = 'YOUR_PUBLISHABLE_OR_ANON_KEY';
-   ```
+Project Management: Interior designers can showcase their work by adding new projects complete with photo uploads, budgets, and timelines.   
 
-   The publishable/anon key is intended for browser use. Never put the `service_role` key in `config.js`, browser code, or any file served to users. Database access must remain protected by the row-level security policies in `schema.sql`.
 
-## 2. Create the database schema
 
-1. In the Supabase Dashboard, open **SQL Editor** and create a new query.
-2. Copy the contents of [`schema.sql`](./schema.sql) into the editor and run it.
-3. Confirm the query completes successfully. DDL statements commonly report **Success. No rows returned**; that is expected.
+## Project structure
 
-The schema creates the app's profiles, companies, projects, categories, comments, notifications, feedback, messaging tables, policies, and triggers. It also sets up account email synchronization. The script seeds example categories; avoid running it repeatedly on a populated database because some initial table and seed statements are not intended as repeatable migrations.
-The schema also creates the public `project-images` Storage bucket used when designers upload project photos.
-
-The designer dashboard adds a repeatable migration block at the bottom of `schema.sql`, starting with **Designer dashboard profile, project workflow and view-history migration**. If the rest of the schema is already installed, run only that block in the Supabase SQL Editor to enable company profiles, project stages, project editing and draft records, workflow sharing, view history, 100-view project milestones, and structured appointment requests. The project editor stores draft edits in `project_drafts`, applies saved edits to `projects`, and supports replacing the existing single project image. New view history and milestone notices start when the migration is applied; they cannot reconstruct events from existing aggregate view counts.
-
-The platform manager's category delete dialog uses the **Platform category reassignment and safe-delete migration** at the bottom of `schema.sql`. Run that section after the designer dashboard migration to enable usage checks and move projects and drafts to another category before deletion.
-
-Customer favourites live in `public.favorites`, created by the **Customer favourites and shortlist-count migration** at the end of `schema.sql`. If the rest of the schema is already installed, run that repeatable section in the Supabase SQL Editor. Its row-level security policies restrict favourites to each active customer, and a trigger keeps project shortlist totals in sync. Customers can save published projects from Browse projects, project details, and designer portfolios, then view or remove them from Favourites.
-
-Run the final **Realtime view analytics migration** section after the designer dashboard migration. It allows platform managers to read project view events and adds the `projects`, `project_activity`, `profiles`, `categories`, `companies`, and `feedback` tables to Supabase Realtime. Platform dashboards, reports, categories, designer verification, and feedback refresh from their database records. Designer portfolio and interest insights update as views are recorded. Historical daily view activity starts when the view-history migration is applied and cannot be inferred from older aggregate view counts. Verification documents are not collected by this app, so the platform queue does not show a placeholder documents action.
-
-If the app reports **Bucket not found** while creating a project or uploading a company logo/cover, open the Supabase SQL Editor for the project configured in `config.js` and run the **Storage bucket used for project photos** section in `schema.sql`. This section is safe to run again. Then retry the upload.
-
-### Create the first User Admin
-
-1. Start the app and register a normal account.
-2. In the Supabase SQL Editor, promote that account using its exact email:
-
-   ```sql
-   update public.profiles
-   set role = 'admin'
-   where email = 'your-admin-email@example.com';
-   ```
-
-3. Sign out and sign in again so the app loads the updated role.
-
-Keep at least one active User Admin account. User Admins can manage accounts and profile definitions; Platform Management has separate platform-only pages and permissions. Password reset requests from the login page direct users to a User Admin, who can set a new password from **Accounts → Reset password**.
-
-## 3. Deploy the account-management Edge Function
-
-The User Admin account tools and customer/designer self-service account deletion call the `admin-users` Edge Function. Deploy it after connecting the app to the project.
-
-1. Install the [Supabase CLI](https://supabase.com/docs/guides/cli) and sign in:
-
-   ```powershell
-   supabase login
-   ```
-
-2. From the repository root, link the local project. The project reference is the part before `.supabase.co` in the Project URL:
-
-   ```powershell
-   supabase link --project-ref YOUR_PROJECT_REF
-   ```
-
-3. In **Project Settings → API**, copy the `service_role` secret. Set it as an Edge Function secret; do not commit or share its value:
-
-   ```powershell
-   supabase secrets set SUPABASE_URL=https://YOUR_PROJECT_REF.supabase.co SUPABASE_SERVICE_ROLE_KEY=YOUR_SERVICE_ROLE_SECRET
-   ```
-
-   You can also set these secrets in the Supabase Dashboard under **Edge Functions → Secrets**. Supabase may already provide `SUPABASE_URL`; explicitly setting it here keeps the function configuration clear.
-
-4. Deploy the function:
-
-   ```powershell
-   supabase functions deploy admin-users
-   ```
-
-The function source is [`supabase/functions/admin-users/index.ts`](./supabase/functions/admin-users/index.ts). Redeploy it whenever that file changes. It checks the caller's authenticated role before allowing privileged actions; the self-delete action is limited to the caller's own active customer or interior designer account.
-
-If account management reports **This account does not have the User Admin role** or **This User Admin account is not active**, verify the signed-in account's `role` and `status` in `public.profiles`. If the function reports `permission denied for table profiles` or `permission denied for table audit_logs`, run the **User Admin audit-log access migration** at the end of `schema.sql`; it grants the Edge Function service role only the profile columns and audit-log writes it needs. If the function does not recognize a role you just changed, confirm its `SUPABASE_URL` matches the URL in `config.js`, then sign out and back in. Redeploy `admin-users` after changing its source.
-
-## 4. Run the app locally
-
-The app uses JavaScript modules, so open it through a local HTTP server rather than directly as a `file://` URL.
-
-From the repository root in PowerShell:
-
-```powershell
-py -m http.server 8000
+```text
+.
+├── index.html                      # App shell: header, nav, <main>, messages button, script tags
+├── style.css                       # Global styles for the whole app
+├── config.js                       # Supabase URL and publishable (anon) key
+├── app.js                          # Entry point (ES module): auth, routing, page rendering, UI event handling
+│
+├── category.js                     # Category management (see below)
+├── company.js                      # CompanyController: designer company profile and logo/cover uploads
+├── project.js                      # ProjectController: project create, edit, drafts, image upload
+├── designer.js                     # DesignerPortfolioController: designer profile, company and projects
+├── favorite.js                     # FavoritesController: customer favourites
+│
+├── schema.sql                      # Tables, RLS policies, triggers, storage bucket, migrations
+│
+├── supabase/
+│   └── functions/
+│       └── admin-users/
+│           └── index.ts            # Edge Function for privileged account management
+│
+├── package.json                    # Dev dependencies and the `npm test` script (Jest)
+├── package-lock.json               # Locked dependency versions
+└── README.md
 ```
 
-Then open <http://localhost:8000> in your browser. Stop the server with `Ctrl+C`.
+### Key files
 
-Alternatively, open the repository in VS Code and use an HTTP-based static preview/Live Server extension.
+| File | Purpose |
+| --- | --- |
+| `index.html` | Static page shell. It loads the controller scripts as classic scripts, then loads `app.js` as an ES module. |
+| `app.js` | Main application logic. It creates the Supabase client, handles login and registration, renders each role's pages, and connects the UI to the controllers. |
+| `config.js` | Holds `SUPABASE_URL` and `SUPABASE_ANON_KEY`. Only the publishable/anon key belongs here, never the `service_role` key. |
+| `schema.sql` | Single source of truth for the database. It also contains repeatable migration blocks at the bottom (see [Create the database schema](#2-create-the-database-schema)). |
+| `supabase/functions/admin-users/` | Server-side function for User Admin account tools and self-service account deletion. Redeploy it after any change. |
 
-## 5. Configure authentication
+### Controllers
 
-In Supabase Dashboard, open **Authentication → URL Configuration**:
+The controller files (`category.js`, `company.js`, `project.js`, `designer.js`, `favorite.js`) are environments separated from the main app.js, they are there for our TDD testing.
 
-- Add your local app URL to **Redirect URLs** (for example, `http://localhost:8000/**`).
-- Set the **Site URL** to your deployed app URL when deploying the app.
-- Configure email confirmation and SMTP/email templates according to your project needs.
+- Each is wrapped in a UMD-style closure, so it works as a browser global (loaded with `<script>` in `index.html`) and as a CommonJS module (`require(...)` in Jest tests).
+- Each takes a Supabase client (`db`) in its constructor, so tests can pass in a mock client.
+- Each throws on Supabase errors, so callers handle failures with `try/catch`.
 
-Registration supports customer and interior designer accounts. Designer registration can create a company record. Create User Admin accounts through the initial SQL promotion or an existing User Admin's account-management tools; do not enable public admin registration.
+| File | Exports | Responsibility |
+| --- | --- | --- |
+| `category.js` | `CategoryController` (default export), plus `ProjectCategory`, `CreateCategoryController`, `DeleteCategoryController`, `CreateCategoryUI`, `DeleteCategoryUI` | Listing categories with project and view stats, creating and updating categories, usage checks, and safe delete or reassignment through the `platform_category_usage` and `platform_move_and_delete_category` database functions. |
+| `company.js` | `CompanyController` | Loading and saving a designer's company information, uploading and replacing logo and cover images, and cleaning up orphaned uploads. |
+| `project.js` | `ProjectController` | Creating projects, loading a project together with its saved draft, saving drafts to `project_drafts`, applying changes, and replacing project images. |
+| `designer.js` | `DesignerPortfolioController` | Loading a designer's profile, company and projects for the portfolio page. |
+| `favorite.js` | `FavoritesController` | Listing, adding and removing a customer's favourite projects. |
 
-## 6. Deploying the web app
+### Running tests
 
-This is a static site. Deploy `index.html`, `app.js`, and `config.js` together to any static web host that serves ES modules over HTTPS. Configure the deployed site URL and redirect URLs in Supabase Authentication settings.
+Tests use [Jest](https://jestjs.io/) (with `supertest` available for HTTP-style tests):
 
-Platform dashboards and reports use database-derived analytics rather than sample figures. View counts update through Supabase Realtime after the **Realtime view analytics migration** has been applied. Date-based charts show recorded events only; they do not fabricate dates for older project view totals.
+```powershell
+npm install
+npm test
+```
 
-## Troubleshooting
-
-- **Could not find a table or column / schema cache error:** confirm `schema.sql` ran against the same Supabase project configured in `config.js`. After schema changes, refresh the Supabase API schema cache if needed.
-- **Bucket not found when uploading a project image or company logo/cover:** run the **Storage bucket used for project photos** section in `schema.sql` in the SQL Editor for the Supabase project configured in `config.js`. Uploads require the `project-images` bucket.
-- **Designer dashboard reports a missing column or table:** run the **Designer dashboard profile, project workflow and view-history migration** block at the bottom of `schema.sql` in the SQL Editor.
-- **View analytics do not update live / platform reports cannot load view history:** run the final **Realtime view analytics migration** section in `schema.sql` after the designer dashboard migration, then reload the app.
-- **Could not find `public.project_milestones` in the schema cache:** run the latest designer dashboard migration block at the bottom of `schema.sql` against the Supabase project configured in `config.js`. The block creates this table and requests a PostgREST schema-cache reload. If the error remains, verify the SQL completed successfully and run `notify pgrst, 'reload schema';` in the SQL Editor, then reload the app.
-- **Favourites fail to load or save / the `public.favorites` table is missing:** run the **Customer favourites and shortlist-count migration** at the end of `schema.sql` in the SQL Editor for the project configured in `config.js`, then reload the app. If it still fails, verify the migration completed and refresh the PostgREST schema cache.
-- **Project details show `permission denied for table comments`:** run the **Comments access permission migration** at the end of `schema.sql` in the SQL Editor for the project configured in `config.js`, then reload the app. Project details will still open if comment access is unavailable.
-- **User Admin dashboard or audit log shows `permission denied for table audit_logs`:** run the **User Admin audit-log access migration** at the end of `schema.sql` in the SQL Editor for the project configured in `config.js`, then sign out and back in. Row-level security continues to restrict audit-log reads to User Admins.
-- **Appointments reports a missing table or permission error:** run the same designer dashboard migration block in the Supabase project configured in `config.js`. Appointment requests are stored in `public.appointment_requests` and protected by row-level security.
-- **Login shows `permission denied for table profiles`:** run the latest designer-dashboard migration block at the bottom of `schema.sql` in the Supabase SQL Editor, then reload and sign in again. It grants the needed table access while keeping row-level security enabled.
-- **Login says the app profile is missing:** run the latest designer-dashboard migration block at the bottom of `schema.sql`. It restores missing profiles from signup metadata; restored accounts receive the customer or designer role, while admin/platform roles must be reassigned by an administrator.
-- **The signed-in header appears but the login form stays visible or the first page fails to load:** run the latest schema in the Supabase SQL Editor. Authenticated users need `SELECT` on `public.categories` as well as the `cat_read` row-level security policy. The app now displays the page-load error instead of silently leaving the login form visible.
-- **Permission denied / row-level security error:** verify that the relevant policies in `schema.sql` were applied and that the signed-in account has the intended role.
-- **Platform Manager sees `permission denied for table categories` when managing categories:** run the category grants in `schema.sql` in the SQL Editor for the project configured in `config.js`. Row-level security remains enabled, so the category policies still limit changes to Platform Managers. If category deletion reports that its usage checks are unavailable, also run the **Platform category reassignment and safe-delete migration** at the bottom of `schema.sql`, after the designer dashboard migration.
-- **Category deletion says `Could not find the function public.platform_category_usage` in the schema cache:** run the complete **Platform category reassignment and safe-delete migration** section at the bottom of `schema.sql` in the SQL Editor for the same Supabase project configured in `config.js`. Confirm it succeeds, then run `notify pgrst, 'reload schema';` in the SQL Editor and reload the app.
-- **Admin account actions fail:** confirm the `admin-users` function is deployed to the configured project and its `SUPABASE_SERVICE_ROLE_KEY` secret is set.
-- **Email change remains pending:** the user may need to confirm the new address. Profile email is synchronized when Supabase Auth applies the email update.
-- **JavaScript module/CORS error:** serve the app from `http://localhost` or a deployed HTTPS static host; don't open the HTML file directly.
-
-## Important security notes
-
-- The frontend publishable/anon key is not a secret. It must be paired with the database's RLS policies.
-- Never expose the Supabase `service_role` secret in frontend code, `config.js`, or a public repository.
-- Do not commit Supabase local state such as `supabase/.temp/`.
-- Review RLS policies and function authorization before changing account or platform-management behavior.
